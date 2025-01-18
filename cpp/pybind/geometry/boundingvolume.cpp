@@ -127,6 +127,25 @@ Returns:
      bounding box is oriented such that its volume is minimized.
 )doc")
 
+            .def_static("create_from_points_minimal_rourke",
+                 &OrientedBoundingBox::CreateFromPointsMinimalRourke,
+                 "points"_a, "robust"_a = false,
+                 R"doc(
+Creates the oriented bounding box with the smallest volume.
+
+The algorithm creates the oriented bounding box with the smallest volume.
+It is inspired by the article "An Exact Algorithm for Finding Minimum 
+Oriented Bounding Boxes" written by Jukka Jylänki. 
+
+Args:
+     points (open3d.utility.Vector3dVector): Input points.
+     robust (bool): If set to true uses a more robust method which works in
+          degenerate cases but introduces noise to the points coordinates.
+
+Returns:
+     open3d.geometry.OrientedBoundingBox: The oriented bounding box. The
+     bounding box is oriented such that its volume is minimized.
+)doc")
             .def("volume", &OrientedBoundingBox::Volume,
                  "Returns the volume of the bounding box.")
             .def("get_box_points", &OrientedBoundingBox::GetBoxPoints,

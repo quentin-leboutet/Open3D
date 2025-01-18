@@ -155,6 +155,68 @@ public:
     static OrientedBoundingBox CreateFromPointsMinimal(
             const std::vector<Eigen::Vector3d>& points, bool robust = false);
 
+    static OrientedBoundingBox CreateFromPointsMinimalRourke(
+            const std::vector<Eigen::Vector3d>& points, bool robust = false);
+
+private:
+    static Eigen::Vector3d normalToFace(const Eigen::Vector3i& face,
+                                        const Eigen::MatrixXd& X) {
+        Eigen::Vector3d a = X.row(face(1)) - X.row(face(0));
+        Eigen::Vector3d b = X.row(face(2)) - X.row(face(0));
+        Eigen::Vector3d normal = a.cross(b).normalized();  // BUG ???
+        return normal;
+    }
+
+    static void computeTheta(const Eigen::RowVector3d& e1,
+                             const Eigen::RowVector3d& e2,
+                             double tol,
+                             const Eigen::Matrix<double, 2, 3>& normal1,
+                             const Eigen::Matrix<double, 2, 3>& normal2,
+                             const Eigen::RowVector3d& mean_normal1,
+                             double& phi,
+                             Eigen::Matrix3d& R_x,
+                             Eigen::VectorXd& theta1_min,
+                             Eigen::VectorXd& theta1_max,
+                             int& rc);
+
+    static void findRow(const std::vector<Eigen::Vector2i>& M,
+                        const Eigen::Vector2i& row,
+                        int& idx,
+                        int& insert);
+
+    static void listEdges(const Eigen::MatrixXi& hullFaces,
+                          const Eigen::MatrixXd& X,
+                          Eigen::MatrixXd& hullEdges);
+
+    static void nodeToFaces(const Eigen::MatrixXi& hullFaces,
+                            const Eigen::MatrixXd& X,
+                            std::vector<std::vector<int>>& hullNodes);
+
+    static void computeR_n(double theta1,
+                           double phi,
+                           const Eigen::Matrix3d& R_x,
+                           const Eigen::RowVector3d& normal2,
+                           Eigen::Matrix3d& R_n);
+
+    static inline double matlab_mod(double a, double b) {
+        if (b == 0.0) {
+            // Handle division by zero as needed
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        return a - b * std::floor(a / b);
+    }
+
+    static std::vector<double> findRealRoots(const Eigen::VectorXd& coeffs);
+
+    static std::vector<int> findEquivalentExtrema(
+            const Eigen::RowVector3d& normal,
+            int todo,
+            const Eigen::MatrixXi& allFaces,
+            const std::vector<std::vector<int>>& allNodes,
+            const Eigen::MatrixXd& X,
+            double tol,
+            int prev);
+
 public:
     /// The center point of the bounding box.
     Eigen::Vector3d center_;

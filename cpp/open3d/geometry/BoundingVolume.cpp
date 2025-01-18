@@ -1385,6 +1385,1917 @@ OrientedBoundingBox OrientedBoundingBox::CreateFromPointsMinimal(
     return minOBB;
 }
 
+void OrientedBoundingBox::computeR_n(double theta1,
+                                     double phi,
+                                     const Eigen::Matrix3d& R_x,
+                                     const Eigen::RowVector3d& normal2,
+                                     Eigen::Matrix3d& R_n) {
+    double ct = std::cos(theta1);
+    double st = std::sin(theta1);
+    double cp = std::cos(phi);
+    double sp = std::sin(phi);
+
+    Eigen::RowVector3d n1_Rx(ct, st, 0);
+    n1_Rx = n1_Rx * R_x;
+    Eigen::RowVector3d n2_Rx(-st * sp, ct * sp, -ct * cp);
+    n2_Rx = n2_Rx * R_x / std::sqrt(ct * ct + st * st * sp * sp);
+    if (n2_Rx.dot(normal2) < 0) {
+        n2_Rx = -n2_Rx;
+    }
+    Eigen::RowVector3d n3_Rx = n1_Rx.cross(n2_Rx);
+    R_n.row(0) = n1_Rx;
+    R_n.row(1) = n2_Rx;
+    R_n.row(2) = n3_Rx;
+}
+
+std::vector<double> OrientedBoundingBox::findRealRoots(
+        const Eigen::VectorXd& coeffs) {
+    // Determine polynomial degree by ignoring leading zeros
+    int n = coeffs.size();
+    int first_nonzero = -1;
+    for (int i = 0; i < n; ++i) {
+        if (coeffs[i] != 0.0) {
+            first_nonzero = i;
+            break;
+        }
+    }
+
+    if (first_nonzero == -1) {
+        throw std::runtime_error(
+                "All coefficients are zero. Polynomial is not defined.");
+    }
+
+    // Degree is size - first_nonzero - 1
+    // For example, if coeffs.size() = 8 and first_nonzero = 0, degree = 7
+    int degree = n - first_nonzero - 1;
+    if (degree < 1) {
+        throw std::runtime_error("Polynomial degree must be at least 1.");
+    }
+
+    // Extract the relevant coefficients of the actual polynomial
+    // After removing leading zeros, the polynomial looks like:
+    // coeffs[first_nonzero]*x^degree + ... + coeffs[n-1]*x^0
+    Eigen::VectorXd poly = coeffs.segment(first_nonzero, n - first_nonzero);
+
+    double leading = poly[0];
+    if (leading == 0.0) {
+        throw std::runtime_error(
+                "Leading coefficient cannot be zero after trimming.");
+    }
+
+    // Make polynomial monic
+    Eigen::VectorXd monic = poly / leading;
+    // monic: x^degree + monic[1]*x^(degree-1) + ... + monic[degree]
+
+    // Construct companion matrix of size degree x degree
+    // The last row: [ -monic[degree], ..., -monic[1] ]
+    Eigen::MatrixXd C = Eigen::MatrixXd::Zero(degree, degree);
+
+    // Fill the superdiagonal with ones
+    for (int i = 0; i < degree - 1; ++i) {
+        C(i, i + 1) = 1.0;
+    }
+
+    // Last row
+    for (int i = 0; i < degree; ++i) {
+        C(degree - 1, i) = -monic[degree - i];
+    }
+
+    // Compute eigenvalues
+    Eigen::EigenSolver<Eigen::MatrixXd> es(C);
+    if (es.info() != Eigen::Success) {
+        throw std::runtime_error("Eigenvalue decomposition failed.");
+    }
+
+    Eigen::VectorXcd eigenvalues = es.eigenvalues();
+
+    // Extract real parts of roots
+    std::vector<double> realRoots;
+    for (int i = 0; i < degree; ++i) {
+        if (std::abs(eigenvalues[i].imag()) < 1e-10) {
+            realRoots.push_back(eigenvalues[i].real());
+        }
+    }
+
+    return realRoots;
+}
+
+std::vector<int> OrientedBoundingBox::findEquivalentExtrema(
+        const Eigen::RowVector3d& normal,
+        int todo,
+        const Eigen::MatrixXi& allFaces,
+        const std::vector<std::vector<int>>& allNodes,
+        const Eigen::MatrixXd& X,
+        double tol,
+        int prev) {
+    int numNodes = static_cast<int>(allNodes.size());
+    std::vector<bool> done(numNodes, false);
+    std::vector<bool> keep(numNodes, false);
+
+    // Initialize the queue with the starting node 'todo'
+    std::queue<int> nodeQueue;
+    nodeQueue.push(todo);
+    done[todo] = true;
+    keep[todo] = true;
+
+    if (prev >= 0 && prev < numNodes) {
+        done[prev] = true;
+    }
+
+    // Compute the limit value for the dot product
+    double dp_todo = X.row(todo).dot(normal);
+    double limit = dp_todo - tol * std::max(std::abs(dp_todo), 1.0);
+
+    // Breadth-first traversal to find equivalent extrema
+    while (!nodeQueue.empty()) {
+        int currentNode = nodeQueue.front();
+        nodeQueue.pop();
+
+        // Get the faces connected to the current node
+        const std::vector<int>& facesToCheck = allNodes[currentNode];
+
+        // Iterate over each face
+        for (int faceIdx : facesToCheck) {
+            // Get the nodes of the face
+            const Eigen::Vector3i& face = allFaces.row(faceIdx);
+
+            // Check each node in the face
+            for (int i = 0; i < 3; ++i) {
+                int nodeIdx = face[i];
+
+                if (!done[nodeIdx]) {
+                    double dp = X.row(nodeIdx).dot(normal);
+                    if (dp >= limit) {
+                        keep[nodeIdx] = true;
+                        nodeQueue.push(nodeIdx);
+                    }
+                    done[nodeIdx] = true;
+                }
+            }
+        }
+    }
+
+    // Collect the nodes that meet the condition
+    std::vector<int> nodes;
+    for (int i = 0; i < numNodes; ++i) {
+        if (keep[i]) {
+            nodes.push_back(i);
+        }
+    }
+
+    return nodes;
+}
+
+void OrientedBoundingBox::findRow(const std::vector<Eigen::Vector2i>& M,
+                                  const Eigen::Vector2i& row,
+                                  int& idx,
+                                  int& insert) {
+    if (M.empty()) {
+        idx = -1;
+        insert = 0;
+        return;
+    }
+    int m = 2;
+
+    int low = 0;
+    int high = static_cast<int>(M.size());
+
+    // Binary search loop
+    while (low < high) {                   // Changed condition to low < high
+        int mid = low + (high - low) / 2;  // More efficient and avoids overflow
+        bool isEqual = true;
+
+        for (int i = 0; i < m; ++i) {  // 0-based indexing in C++
+            if (row(i) < M[mid](i)) {  // Removed -1 to access correctly
+                high = mid;
+                isEqual = false;
+                break;
+            } else if (row(i) > M[mid](i)) {
+                low = mid + 1;
+                isEqual = false;
+                break;
+            }
+            // If equal, continue to next column
+        }
+        // If all columns are equal
+        if (isEqual) {
+            idx = mid;
+            insert = -1;
+            return;  // Found the row, can return early
+        }
+    }
+
+    idx = -1;      // Row not found
+    insert = low;  // Position to insert
+}
+
+void OrientedBoundingBox::nodeToFaces(
+        const Eigen::MatrixXi& hullFaces,
+        const Eigen::MatrixXd& X,
+        std::vector<std::vector<int>>& hullNodes) {
+    int numFaces = (int)hullFaces.rows();
+    int maxNode = hullFaces.maxCoeff();
+    hullNodes.assign(maxNode + 1, std::vector<int>());
+
+    auto normalToFaceFunc = [&](const Eigen::Vector3i& f) {
+        return normalToFace(f, X);
+    };
+
+    auto normalizedCrossProduct = [&](const Eigen::Vector3d& u,
+                                      const Eigen::Vector3d& v) {
+        Eigen::Vector3d c = u.cross(v);
+        double n = c.norm();
+        if (n > 0.0) c /= n;
+        return c;
+    };
+
+    auto computeTripleProduct = [&](int newNode, const Eigen::Vector3d& center,
+                                    const Eigen::Vector3d& center_l,
+                                    const Eigen::Vector3d& normal,
+                                    const Eigen::Vector3d& normal_l) {
+        Eigen::Vector3d mean_normal = (normal - normal_l) / 2.0;
+        Eigen::Vector3d vec1 = center - X.row(newNode).transpose();
+        Eigen::Vector3d vec2 = center_l - X.row(newNode).transpose();
+        Eigen::Vector3d cross_vec = normalizedCrossProduct(vec1, vec2);
+        return cross_vec.dot(mean_normal);
+    };
+
+    for (int k = 0; k < 3 * numFaces; ++k) {
+        int faceIndex = k / 3;  // 0-based face index
+        int localIdx = k % 3;
+
+        static Eigen::Vector3i currentFace;
+        static Eigen::Vector3d center;
+        static Eigen::Vector3d normal;
+
+        if (localIdx == 0) {
+            currentFace = hullFaces.row(faceIndex);
+            center = (X.row(currentFace(0)) + X.row(currentFace(1)) +
+                      X.row(currentFace(2))) /
+                     3.0;
+            normal = -normalToFaceFunc(currentFace);
+        }
+
+        int newNode = currentFace(localIdx);
+        std::vector<int>& faces = hullNodes[newNode];
+
+        // Replicate MATLAB logic
+        // l = [];
+        // for l=1:length(faces)
+        //    ...
+        // end
+        int forward_break_at = -1;  // If we break, store the iteration here
+        double triple_product;
+        for (int l = 0; l < (int)faces.size(); ++l) {
+            int face_idx = faces[l];
+            Eigen::Vector3i f = hullFaces.row(face_idx);
+            Eigen::Vector3d center_l =
+                    (X.row(f(0)) + X.row(f(1)) + X.row(f(2))) / 3.0;
+            Eigen::Vector3d normal_l = normalToFaceFunc(f);
+
+            triple_product = computeTripleProduct(newNode, center, center_l,
+                                                  normal, normal_l);
+            if (triple_product > 0.0) {
+                forward_break_at = l;  // We break at iteration l (0-based)
+                break;
+            }
+        }
+
+        // Determine final l in MATLAB (1-based) to insert
+        int l_matlab;
+        if (faces.empty()) {
+            // isempty(l) => l was never assigned since no loop ran
+            l_matlab = 1;
+        } else {
+            if (forward_break_at == -1) {
+                // No break in forward loop
+                // After loop, l in MATLAB = length(faces)
+                // Then no isempty(l), l != 0 => l = l+1 at end
+                // final l_matlab = length(faces) + 1
+                l_matlab = (int)faces.size() + 1;
+            } else {
+                // We broke at iteration forward_break_at (0-based)
+                // MATLAB: l was (forward_break_at+1) when break triggered
+                // then l = l - 1 => l_matlab = forward_break_at (1-based:
+                // l_matlab = forward_break_at+1 - 1 = forward_break_at) Since
+                // forward_break_at is 0-based, l_matlab = forward_break_at
+                // (0-based) + 1 - 1 = forward_break_at Wait carefully: If break
+                // at iteration l (0-based), MATLAB l= l (1-based) at break =>
+                // l= l_break -1 afterwards 1-based l at break was
+                // (forward_break_at+1) l = l -1 => l_matlab =
+                // (forward_break_at+1)-1 = forward_break_at
+                l_matlab =
+                        forward_break_at;  // now forward_break_at is 0-based,
+                                           // so l_matlab is 1 less than actual?
+                // Actually, if forward_break_at = 0 (first iteration),
+                // l_matlab=0 after l=l-1 in MATLAB is correct.
+
+                if (l_matlab == 0) {
+                    // reverse search
+                    bool reverse_break = false;
+                    for (int rl = (int)faces.size(); rl >= 1; rl--) {
+                        int face_idx = faces[rl - 1];
+                        Eigen::Vector3i f = hullFaces.row(face_idx);
+                        Eigen::Vector3d center_l =
+                                (X.row(f(0)) + X.row(f(1)) + X.row(f(2))) / 3.0;
+                        Eigen::Vector3d normal_l = normalToFaceFunc(f);
+                        triple_product = computeTripleProduct(
+                                newNode, center, center_l, normal, normal_l);
+
+                        if (triple_product < 0.0) {
+                            // l = l+1 in MATLAB
+                            // rl is 1-based here, so l_matlab = rl+1
+                            l_matlab = rl + 1;
+                            reverse_break = true;
+                            break;
+                        }
+                    }
+                    if (!reverse_break) {
+                        // no break in reverse => l_matlab stays 0
+                        // After reverse loop: l = l-1; l = l+1; cancel out =>
+                        // still l=0 final step l=l+1 => l=1
+                        l_matlab = 1;
+                    } else {
+                        // if we did break in reverse:
+                        // after reverse search: l=l-1; l=l+1; cancel out, so
+                        // l_matlab remains rl+1 final l=l+1 => l_matlab =
+                        // (rl+1)+1 = rl+2 but we must follow code closely:
+                        // Check original MATLAB code carefully. It does:
+                        // if l==0
+                        //   for l=length(faces):-1:1 ...
+                        //       if triple_product < 0
+                        //          l=l+1; break;
+                        //       end
+                        //   end
+                        //   l=l-1;
+                        // end
+                        // l=l+1 at the end outside if
+                        //
+                        // Steps if break in reverse at rl:
+                        // l after break in reverse = rl+1
+                        // then l=l-1 => l=rl
+                        // l=l+1 at end => l=rl+1
+                        l_matlab = l_matlab - 1;  // l=l-1
+                        l_matlab = l_matlab + 1;  // l=l+1 at end
+                        // So final l_matlab = rl+1 still.
+                    }
+                } else {
+                    // if l_matlab != 0
+                    // just l=l+1 at the end
+                    l_matlab = l_matlab + 1;
+                }
+            }
+        }
+
+        // Now l_matlab is the final 1-based insertion position
+        // In C++ 0-based indexing:
+        int insert_pos = l_matlab - 1;
+
+        // Bound checks
+        if (insert_pos < 0) insert_pos = 0;
+        if (insert_pos > (int)faces.size()) insert_pos = (int)faces.size();
+
+        faces.insert(faces.begin() + insert_pos, faceIndex);
+    }
+}
+
+// Main function to list edges from hull faces
+void OrientedBoundingBox::listEdges(const Eigen::MatrixXi& hullFaces,
+                                    const Eigen::MatrixXd& X,
+                                    Eigen::MatrixXd& hullEdges) {
+    struct EdgeInfo {
+        int origin;               // Origin node index
+        int tip;                  // Tip node index
+        int leftFace;             // Left face index (0 if none)
+        int rightFace;            // Right face index (0 if none)
+        Eigen::Vector3d edgeVec;  // Normalized edge vector
+        // Comparator for sorting edges based on origin and tip
+        bool operator<(const EdgeInfo& other) const {
+            if (origin != other.origin) return origin < other.origin;
+            return tip < other.tip;
+        }
+    };
+
+    // Initialize an empty list of edges
+    std::vector<EdgeInfo> edgeList;
+    Eigen::Vector3d normal;
+    Eigen::Vector3i face;
+    // Iterate through each face and its three edges
+    for (int k = 0; k < 3 * hullFaces.rows(); ++k) {
+        if (k % 3 == 0) {
+            face = hullFaces.row(int(k / 3));
+            normal = -normalToFace(face, X);
+        }
+        // Determine the two nodes forming the current edge
+        int node1 = face(k % 3);
+        int node2 = face((k + 1) % 3);
+        // Sort the node indices to ensure consistency
+        Eigen::Vector2i newEdge;
+        newEdge << std::min(node1, node2), std::max(node1, node2);
+        // Prepare a vector of existing edges' origin and tip for findRow
+        std::vector<Eigen::Vector2i> existingEdges;
+        for (const auto& edge : edgeList) {
+            existingEdges.emplace_back(Eigen::Vector2i(edge.origin, edge.tip));
+        }
+        // Find if the current edge already exists
+        int idx = -1;
+        int insertPos = 0;
+        findRow(existingEdges, newEdge, idx, insertPos);
+        if (idx > -1) {
+            // Edge already exists
+            bool isRight = (edgeList[idx].rightFace == -1);
+            if (isRight) {
+                edgeList[idx].rightFace = int(k / 3);
+            } else {
+                edgeList[idx].leftFace = int(k / 3);
+            }
+
+            // If both faces are already assigned, you might want to handle
+            // duplicates
+        } else {
+            // Edge does not exist; insert a new edge
+            // Compute the normalized edge vector
+            Eigen::Vector3d vecEdge = X.row(newEdge(1)) - X.row(newEdge(0));
+            double normEdge = vecEdge.norm();
+            if (normEdge < 1e-12) {
+                std::cerr << "Warning: Edge with zero length detected between "
+                             "nodes "
+                          << newEdge(0) << " and " << newEdge(1)
+                          << ". Skipping.\n";
+                continue;  // Skip zero-length edges
+            }
+            Eigen::Vector3d normalizedEdge = vecEdge / normEdge;
+            // Determine if the face is on the right side
+            // Compute cross product and scalar triple product
+            // crossNorm(normal, vecEdge, (X(face(2), :) - X(face(0), :))')
+            // Note: Adjust node indices for 0-based indexing
+            Eigen::Vector3d vecA = normal.cross(vecEdge).normalized();
+            Eigen::Vector3d vecB =
+                    X.row(face((k + 2) % 3)) - X.row(face(k % 3));
+            double tripleProduct = vecA.dot(vecB);
+            bool isRight = (tripleProduct < 0);
+            // Create a new EdgeInfo
+            EdgeInfo newEdgeInfo;
+            newEdgeInfo.origin = newEdge(0);
+            newEdgeInfo.tip = newEdge(1);
+            newEdgeInfo.leftFace = -1;
+            newEdgeInfo.rightFace = -1;
+            if (isRight) {
+                newEdgeInfo.rightFace = int(k / 3);
+            } else {
+                newEdgeInfo.leftFace = int(k / 3);
+            }
+            // newEdgeInfo.leftFace =
+            //         isRight ? 0 : int(k / 3);  // Left face if not right
+            // newEdgeInfo.rightFace =
+            //         isRight ? int(k / 3) : 0;  // Right face if isRight
+            newEdgeInfo.edgeVec = normalizedEdge;
+            // Insert the new edge at the determined position
+            if (insertPos < 0 ||
+                insertPos > static_cast<int>(edgeList.size())) {
+                std::cerr << "Error: Invalid insertion position " << insertPos
+                          << " for edge (" << newEdge(0) << ", " << newEdge(1)
+                          << ").\n";
+                assert(false);  // Handle according to your error policy
+            }
+            edgeList.insert(edgeList.begin() + insertPos, newEdgeInfo);
+        }
+    }
+    // After processing all edges, convert the edgeList to Eigen::MatrixXd
+    // Each edge has 7 components: origin, tip, leftFace, rightFace, edgeVec.x,
+    // edgeVec.y, edgeVec.z
+    hullEdges.resize(edgeList.size(), 7);
+    for (size_t i = 0; i < edgeList.size(); ++i) {
+        hullEdges(i, 0) = edgeList[i].origin;
+        hullEdges(i, 1) = edgeList[i].tip;
+        hullEdges(i, 2) = edgeList[i].leftFace;
+        hullEdges(i, 3) = edgeList[i].rightFace;
+        hullEdges(i, 4) = edgeList[i].edgeVec(0);
+        hullEdges(i, 5) = edgeList[i].edgeVec(1);
+        hullEdges(i, 6) = edgeList[i].edgeVec(2);
+    }
+}
+
+void OrientedBoundingBox::computeTheta(
+        const Eigen::RowVector3d& e1,
+        const Eigen::RowVector3d& e2,
+        double tol,
+        const Eigen::Matrix<double, 2, 3>& normal1,
+        const Eigen::Matrix<double, 2, 3>& normal2,
+        const Eigen::RowVector3d& mean_normal1,
+        double& phi,
+        Eigen::Matrix3d& R_x,
+        Eigen::VectorXd& theta1_min,
+        Eigen::VectorXd& theta1_max,
+        int& rc) {
+    // Computation of the frame axes and angle
+    Eigen::RowVector3d c = e2.cross(e1);  // Cross product
+
+    if (c.norm() < tol * 1e-1) {
+        c << 0, e1(2), -e1(1);
+        if (c.norm() < tol * 1e-1) {
+            c << e1(1), -e1(0), 0;
+        }
+    }
+
+    Eigen::RowVector3d x = c.normalized();
+    c = e1.cross(x);
+    Eigen::RowVector3d y = c.normalized();
+    Eigen::RowVector3d z = e1;
+
+    // Construct R_x matrix
+    R_x.row(0) = x;
+    R_x.row(1) = y;
+    R_x.row(2) = z;
+
+    // Compute phi
+    double arg = (y.cross(e2)).dot(x);
+    // Ensure the argument of asin is within [-1, 1]
+    arg = std::clamp(arg, -1.0, 1.0);
+    phi = std::asin(arg);
+
+    // Computation of the bound on theta1
+    rc = 0;
+    Eigen::MatrixXd n1(4, 3);
+    Eigen::Vector2d sigma;
+    if (std::abs(phi) > tol * 1e6) {
+        n1.topRows<2>() = normal1;
+        for (int i = 0; i < 2; ++i) {
+            Eigen::RowVector3d temp = normal2.row(i);
+            n1.row(2 + i) = temp.cross(e1);
+        }
+
+        // Compute sigma
+        sigma = n1.bottomRows<2>() * mean_normal1.transpose();
+        for (int i = 0; i < 2; ++i) {
+            if (std::abs(sigma(i)) < tol) {
+                sigma(i) = 1.0;
+            }
+        }
+
+        Eigen::Vector2d norms;
+        for (int i = 0; i < 2; ++i) {
+            norms(i) = n1.row(2 + i).norm();
+        }
+
+        Eigen::Vector2d signs;
+        for (int i = 0; i < 2; ++i) {
+            signs(i) = (sigma(i) >= 0) ? 1.0 : -1.0;
+        }
+        sigma = signs.array() / norms.array();
+
+        // Update n1
+        Eigen::MatrixXd sigma_mat(2, 3);
+        sigma_mat = sigma.replicate(1, 3);
+        n1.bottomRows<2>() = n1.bottomRows<2>().array() * sigma_mat.array();
+
+        // Compute theta1
+        Eigen::MatrixXd cross_products(4, 3);
+        for (int i = 0; i < 4; ++i) {
+            Eigen::Vector3d temp = n1.row(i).transpose();
+            cross_products.row(i) = x.cross(temp);
+        }
+
+        Eigen::Vector4d numerator = cross_products * e1.transpose();
+        Eigen::Vector4d denominator = n1 * x.transpose();
+        Eigen::VectorXd theta1(4);
+        for (int i = 0; i < 4; ++i) {
+            theta1(i) = std::atan2(numerator(i), denominator(i));
+        }
+
+        // Adjust theta1 if mean_normal1.dot(x) < 0
+        if (mean_normal1.dot(x) < 0) {
+            for (int i = 0; i < theta1.size(); ++i) {
+                if (theta1(i) < 0) {
+                    theta1(i) += 2 * M_PI;
+                }
+            }
+        }
+
+        // Compute theta1_min and theta1_max
+        if (rc != 0) {
+            theta1_min.resize(2);
+            theta1_max.resize(2);
+            theta1_min(0) = theta1(0);
+            theta1_min(1) = rc * M_PI / 2;
+            theta1_max(0) = rc * M_PI / 2;
+            theta1_max(1) = theta1(1);
+        } else {
+            if (phi < 0) {
+                // Swap theta1(2) and theta1(3)
+                std::swap(theta1(2), theta1(3));
+            }
+            if (theta1(3) >= theta1(2) - tol) {
+                if (theta1(1) - theta1(0) < -tol) {
+                    throw std::runtime_error(
+                            "Assertion failed: theta1(1) - theta1(0) < -tol");
+                }
+                theta1_min.resize(1);
+                theta1_max.resize(1);
+                theta1_min(0) = std::max(theta1(0), theta1(2));
+                theta1_max(0) = std::min(theta1(1), theta1(3));
+            } else {
+                // Compute adjusted theta1_min and theta1_max
+                Eigen::Matrix2d theta1_pairs_min;
+                theta1_pairs_min << theta1(0), theta1(0), theta1(2), theta1(2);
+                Eigen::Matrix2d adjust_min;
+                adjust_min << 0, 0, M_PI, 0;
+                theta1_pairs_min = theta1_pairs_min - adjust_min;
+
+                Eigen::Matrix2d theta1_pairs_max;
+                theta1_pairs_max << theta1(1), theta1(1), theta1(3), theta1(3);
+                Eigen::Matrix2d adjust_max;
+                adjust_max << 0, 0, 0, M_PI;
+                theta1_pairs_max = theta1_pairs_max + adjust_max;
+
+                theta1_min.resize(2);
+                theta1_max.resize(2);
+                theta1_min(0) = std::max(theta1_pairs_min(0, 0),
+                                         theta1_pairs_min(1, 0));
+                theta1_min(1) = std::max(theta1_pairs_min(0, 1),
+                                         theta1_pairs_min(1, 1));
+                theta1_max(0) = std::min(theta1_pairs_max(0, 0),
+                                         theta1_pairs_max(1, 0));
+                theta1_max(1) = std::min(theta1_pairs_max(0, 1),
+                                         theta1_pairs_max(1, 1));
+            }
+        }
+    } else {
+        // Second branch
+        Eigen::MatrixXd c(2, 3);
+        for (int i = 0; i < 2; ++i) {
+            Eigen::RowVector3d temp = normal2.row(i);
+            c.row(i) = temp.cross(z);
+        }
+
+        double sigma;
+        if (mean_normal1.dot(y) > 0) {
+            sigma = 1;
+        } else {
+            if (mean_normal1.dot(x) < 0) {
+                sigma = 3;
+            } else {
+                sigma = -1;
+            }
+        }
+
+        double c_dot = c.row(0).dot(c.row(1));
+        if (c_dot < -tol * 1e2) {
+            // Compute theta1
+            Eigen::MatrixXd cross_products(2, 3);
+            for (int i = 0; i < 2; ++i) {
+                Eigen::RowVector3d temp = normal1.row(i);
+                cross_products.row(i) = x.cross(temp);
+            }
+
+            Eigen::Vector2d numerator = cross_products * e1.transpose();
+            Eigen::Vector2d denominator = normal1 * x.transpose();
+            Eigen::VectorXd theta1(2);
+            for (int i = 0; i < 2; ++i) {
+                theta1(i) = std::atan2(numerator(i), denominator(i));
+            }
+
+            // Compute c = cross(normal1, [y; y])
+            Eigen::MatrixXd c_normal1(2, 3);
+            for (int i = 0; i < 2; ++i) {
+                Eigen::RowVector3d temp = normal1.row(i);
+                c_normal1.row(i) = temp.cross(y);
+            }
+
+            double c_normal1_dot = c_normal1.row(0).dot(c_normal1.row(1));
+            if (c_normal1_dot < -tol) {
+                rc = static_cast<int>(sigma);
+            } else {
+                theta1.conservativeResize(4);
+                theta1(2) = 0;
+                theta1(3) = 2 * M_PI;
+            }
+
+            // Adjust theta1 if mean_normal1.dot(x) < 0
+            if (mean_normal1.dot(x) < 0) {
+                for (int i = 0; i < theta1.size(); ++i) {
+                    if (theta1(i) < 0) {
+                        theta1(i) += 2 * M_PI;
+                    }
+                }
+            }
+
+            // Compute theta1_min and theta1_max
+            if (rc != 0) {
+                theta1_min.resize(2);
+                theta1_max.resize(2);
+                theta1_min(0) = theta1(0);
+                theta1_min(1) = rc * M_PI / 2;
+                theta1_max(0) = rc * M_PI / 2;
+                theta1_max(1) = theta1(1);
+            } else {
+                if (phi < 0) {
+                    // Swap theta1(2) and theta1(3)
+                    std::swap(theta1(2), theta1(3));
+                }
+                if (theta1(3) >= theta1(2) - tol) {
+                    if (theta1(1) - theta1(0) < -tol) {
+                        throw std::runtime_error(
+                                "Assertion failed: theta1(2) - theta1(1) < "
+                                "-tol");
+                    }
+                    theta1_min.resize(1);
+                    theta1_max.resize(1);
+                    theta1_min(0) = std::max(theta1(0), theta1(2));
+                    theta1_max(0) = std::min(theta1(1), theta1(3));
+                } else {
+                    // Compute adjusted theta1_min and theta1_max
+                    Eigen::Matrix2d theta1_pairs_min;
+                    theta1_pairs_min << theta1(0), theta1(0), theta1(2),
+                            theta1(2);
+                    Eigen::Matrix2d adjust_min;
+                    adjust_min << 0, 0, M_PI, 0;
+                    theta1_pairs_min = theta1_pairs_min - adjust_min;
+
+                    Eigen::Matrix2d theta1_pairs_max;
+                    theta1_pairs_max << theta1(1), theta1(1), theta1(3),
+                            theta1(3);
+                    Eigen::Matrix2d adjust_max;
+                    adjust_max << 0, 0, 0, M_PI;
+                    theta1_pairs_max = theta1_pairs_max + adjust_max;
+
+                    theta1_min.resize(2);
+                    theta1_max.resize(2);
+                    theta1_min(0) = std::max(theta1_pairs_min(0, 0),
+                                             theta1_pairs_min(1, 0));
+                    theta1_min(1) = std::max(theta1_pairs_min(0, 1),
+                                             theta1_pairs_min(1, 1));
+                    theta1_max(0) = std::min(theta1_pairs_max(0, 0),
+                                             theta1_pairs_max(1, 0));
+                    theta1_max(1) = std::min(theta1_pairs_max(0, 1),
+                                             theta1_pairs_max(1, 1));
+                }
+            }
+        } else {
+            // Compute theta1
+            Eigen::MatrixXd cross_products(2, 3);
+            for (int i = 0; i < 2; ++i) {
+                Eigen::RowVector3d temp = normal1.row(i);
+                cross_products.row(i) = x.cross(temp);
+            }
+
+            Eigen::VectorXd numerator = cross_products * e1.transpose();
+            Eigen::VectorXd denominator = normal1 * x.transpose();
+            Eigen::VectorXd theta1(4);
+            for (int i = 0; i < 2; ++i) {
+                theta1(i) = std::atan2(numerator(i), denominator(i));
+            }
+            theta1(2) = sigma * M_PI / 2;
+            theta1(3) = sigma * M_PI / 2;
+
+            // Adjust theta1 if mean_normal1.dot(x) < 0
+            if (mean_normal1.dot(x) < 0) {
+                for (int i = 0; i < theta1.size(); ++i) {
+                    if (theta1(i) < 0) {
+                        theta1(i) += 2 * M_PI;
+                    }
+                }
+            }
+
+            // Compute theta1_min and theta1_max
+            if (rc != 0) {
+                theta1_min.resize(2);
+                theta1_max.resize(2);
+                theta1_min(0) = theta1(0);
+                theta1_min(1) = rc * M_PI / 2;
+                theta1_max(0) = rc * M_PI / 2;
+                theta1_max(1) = theta1(1);
+            } else {
+                if (phi < 0) {
+                    // Swap theta1(2) and theta1(3)
+                    std::swap(theta1(2), theta1(3));
+                }
+                if (theta1(3) >= theta1(2) - tol) {
+                    if (theta1(1) - theta1(0) < -tol) {
+                        throw std::runtime_error(
+                                "Assertion failed: theta1(2) - theta1(1) < "
+                                "-tol");
+                    }
+                    theta1_min.resize(1);
+                    theta1_max.resize(1);
+                    theta1_min(0) = std::max(theta1(0), theta1(2));
+                    theta1_max(0) = std::min(theta1(1), theta1(3));
+                } else {
+                    // Compute adjusted theta1_min and theta1_max
+                    Eigen::MatrixXd theta1_pairs_min(2, 2);
+                    theta1_pairs_min << theta1(0), theta1(0), theta1(2),
+                            theta1(2);
+                    Eigen::MatrixXd adjust_min(2, 2);
+                    adjust_min << 0, 0, M_PI, 0;
+                    theta1_pairs_min = theta1_pairs_min - adjust_min;
+
+                    Eigen::MatrixXd theta1_pairs_max(2, 2);
+                    theta1_pairs_max << theta1(1), theta1(1), theta1(3),
+                            theta1(3);
+                    Eigen::MatrixXd adjust_max(2, 2);
+                    adjust_max << 0, 0, 0, M_PI;
+                    theta1_pairs_max = theta1_pairs_max + adjust_max;
+
+                    theta1_min.resize(2);
+                    theta1_max.resize(2);
+                    theta1_min(0) = std::max(theta1_pairs_min(0, 0),
+                                             theta1_pairs_min(1, 0));
+                    theta1_min(1) = std::max(theta1_pairs_min(0, 1),
+                                             theta1_pairs_min(1, 1));
+                    theta1_max(0) = std::min(theta1_pairs_max(0, 0),
+                                             theta1_pairs_max(1, 0));
+                    theta1_max(1) = std::min(theta1_pairs_max(0, 1),
+                                             theta1_pairs_max(1, 1));
+                }
+            }
+        }
+    }
+
+    // Final adjustments to theta1_min and theta1_max
+    Eigen::VectorXd gud(theta1_min.size());
+    for (int i = 0; i < theta1_min.size(); ++i) {
+        gud(i) = (theta1_min(i) < theta1_max(i) - tol * 1e3);
+    }
+
+    std::vector<double> theta1_min_filtered;
+    std::vector<double> theta1_max_filtered;
+
+    for (int i = 0; i < gud.size(); ++i) {
+        if (gud(i)) {
+            theta1_min_filtered.push_back(theta1_min(i) + tol);
+            theta1_max_filtered.push_back(theta1_max(i) - tol * 2e1);
+        }
+    }
+
+    // Convert back to Eigen vectors
+    if (!theta1_min_filtered.empty()) {
+        theta1_min = Eigen::Map<Eigen::VectorXd>(theta1_min_filtered.data(),
+                                                 theta1_min_filtered.size());
+        theta1_max = Eigen::Map<Eigen::VectorXd>(theta1_max_filtered.data(),
+                                                 theta1_max_filtered.size());
+    } else {
+        theta1_min.resize(0);
+        theta1_max.resize(0);
+    }
+}
+OrientedBoundingBox OrientedBoundingBox::CreateFromPointsMinimalRourke(
+        const std::vector<Eigen::Vector3d>& points, bool robust) {
+
+    // Check if input is valid
+    if (points.empty()) {
+        utility::LogError("The point set is empty.");
+        return OrientedBoundingBox();
+    }
+
+    // Tolerance for numerical computations
+    const double tol = 1e-9;
+
+    // Normalize the points to improve numerical stability
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+    for (const auto& pt : points) {
+        mean += pt;
+    }
+    mean /= static_cast<double>(points.size());
+
+    std::vector<Eigen::Vector3d> normalized_points;
+    normalized_points.reserve(points.size());
+    double normFactor = 0.0;
+    for (const auto& pt : points) {
+        Eigen::Vector3d centered = pt - mean;
+        double norm = centered.norm();
+        if (norm > normFactor) normFactor = norm;
+        normalized_points.push_back(centered);
+    }
+    for (auto& pt : normalized_points) {
+        pt /= normFactor;
+    }
+
+    // Compute the convex hull of the normalized points
+    std::shared_ptr<TriangleMesh> convex_hull_mesh;
+    std::tie(convex_hull_mesh, std::ignore) =
+            Qhull::ComputeConvexHull(normalized_points, robust);
+
+    if (!convex_hull_mesh) {
+        utility::LogError("Failed to compute convex hull.");
+        return OrientedBoundingBox();
+    }
+
+    // Get convex hull vertices and triangles
+    const std::vector<Eigen::Vector3d>& hullV = convex_hull_mesh->vertices_;
+    const std::vector<Eigen::Vector3i>& hullT = convex_hull_mesh->triangles_;
+    int numVertices = static_cast<int>(hullV.size());
+    int numTriangles = static_cast<int>(hullT.size());
+
+    // Map to Eigen types
+    Eigen::MatrixXd X(numVertices, 3);
+    // X << -0.5774, -0.5774, -0.5774, 0.5774, 0.5774, -0.5774, 0.5774, -0.5774,
+    //         0.5774, -0.5774, 0.5774, 0.5774;
+    // X << 6.8956e-02, 7.9829e-01, -3.4341e-01, 7.3657e-02, 7.5508e-01,
+    //         -3.5821e-01, 6.5277e-02, 7.1861e-01, -3.7886e-01, 7.7698e-02,
+    //         8.2102e-01, -3.2310e-01, 7.1300e-02, 6.4208e-01, -3.9582e-01,
+    //         -2.3525e-03, 7.5568e-01, -3.7787e-01, 7.3631e-02, 8.7308e-01,
+    //         -2.9454e-01, 8.3708e-02, 8.7032e-01, -2.8927e-01, 6.3634e-02,
+    //         6.1436e-01, -4.0364e-01, -2.3525e-03, 8.7290e-01, -3.1595e-01,
+    //         6.1658e-02, 5.1298e-01, -4.0391e-01, 9.2000e-02, 7.0000e-01,
+    //         -3.0281e-01, -2.3525e-03, 6.1491e-01, -4.0393e-01, -7.3662e-02,
+    //         7.9829e-01, -3.4341e-01, 7.9589e-02, 9.3866e-01, -2.2563e-01,
+    //         -2.3525e-03, 5.2181e-01, -4.1530e-01, 9.6215e-02, 7.9981e-01,
+    //         -2.6012e-01, 8.7784e-02, 6.0019e-01, -3.4551e-01, -6.8340e-02,
+    //         6.1436e-01, -4.0364e-01, -6.9983e-02, 7.1861e-01, -3.7886e-01,
+    //         -7.8337e-02, 8.7308e-01, -2.9454e-01, 8.5512e-02, 9.2540e-01,
+    //         -2.3040e-01, -2.3525e-03, 9.5224e-01, -2.3568e-01, -2.3525e-03,
+    //         4.0164e-01, -3.9758e-01, 5.9026e-02, 3.4886e-01, -3.6807e-01,
+    //         -7.8362e-02, 7.5508e-01, -3.5821e-01, -8.4294e-02, 9.3866e-01,
+    //         -2.2563e-01, -8.2403e-02, 8.2102e-01, -3.2310e-01, -2.3525e-03,
+    //         9.8520e-01, -1.7140e-01, -6.6364e-02, 5.1298e-01, -4.0391e-01,
+    //         -7.6006e-02, 6.4208e-01, -3.9582e-01, -8.8414e-02, 8.7032e-01,
+    //         -2.8927e-01, -2.3525e-03, 2.7876e-01, -3.5365e-01, -6.3733e-02,
+    //         3.4886e-01, -3.6807e-01, -9.0217e-02, 9.2540e-01, -2.3040e-01,
+    //         -8.7365e-02, 9.6956e-01, -1.6329e-01, -9.6706e-02, 7.0000e-01,
+    //         -3.0281e-01, -1.0587e-01, 9.2333e-01, -1.4329e-01, -8.8952e-02,
+    //         9.6313e-01, -1.5868e-01, 8.5590e-02, 9.7548e-01, -1.5620e-01,
+    //         1.0578e-01, 9.1045e-01, -1.2461e-01, 7.9080e-02, 8.1491e-01,
+    //         -8.4354e-02, -9.2490e-02, 6.0019e-01, -3.4551e-01, -1.0092e-01,
+    //         7.9981e-01, -2.6012e-01, 9.5054e-02, 9.6784e-01, -1.5122e-01,
+    //         -1.1067e-01, 8.8615e-01, -1.2631e-01, -9.4379e-02, 8.1322e-01,
+    //         -9.2525e-02, -8.7752e-02, 8.0241e-01, -8.8124e-02, -9.8310e-02,
+    //         -6.4334e-01, 3.9246e-01, -2.3525e-03, -6.4334e-01, 4.1817e-01,
+    //         -2.3525e-03, -6.6075e-01, 4.2216e-01, 1.9355e-01, -6.6075e-01,
+    //         2.2626e-01, 1.6731e-01, -6.6075e-01, 1.2831e-01, -1.0031e-01,
+    //         -6.6075e-01, 3.9592e-01, 9.3220e-02, -6.8275e-01, 6.0721e-02,
+    //         -2.3525e-03, -6.8275e-01, 3.5113e-02, -1.7201e-01, -6.6075e-01,
+    //         1.2831e-01, -2.3525e-03, -6.8275e-01, 4.1740e-01, 1.1816e-01,
+    //         -7.1066e-01, 4.3499e-01, 1.8879e-01, -6.8275e-01, 2.2626e-01,
+    //         1.6318e-01, -6.8275e-01, 1.3069e-01, -9.7926e-02, -6.8275e-01,
+    //         6.0721e-02, -9.7926e-02, -6.8275e-01, 3.9180e-01, -1.9826e-01,
+    //         -6.6075e-01, 2.2626e-01, 2.0638e-01, -7.1066e-01, 3.4677e-01,
+    //         -1.6789e-01, -6.8275e-01, 1.3069e-01, -1.9350e-01, -6.8275e-01,
+    //         2.2626e-01, -2.1108e-01, -7.1066e-01, 3.4677e-01;
+
+    Eigen::MatrixXi hullFaces(numTriangles, 3);
+
+    // hullFaces << 65, 56, 68, 64, 46, 68, 46, 64, 44, 41, 52, 65, 52, 41, 17,
+    // 63,
+    //         51, 58, 59, 41, 65, 59, 51, 50, 51, 59, 58, 59, 65, 68, 63, 59,
+    //         68, 59, 63, 58, 40, 36, 29, 42, 59, 50, 59, 42, 41, 34, 62, 56,
+    //         56, 62, 68, 67, 64, 68, 55, 25, 56, 55, 56, 65, 33, 34, 56, 25,
+    //         33, 56, 52, 60, 65, 51, 49, 50, 46, 49, 68, 38, 46, 44, 38, 39,
+    //         46, 39, 38, 36, 40, 39, 36, 39, 45, 41, 45, 39, 40, 23, 40, 29,
+    //         32, 38, 44, 64, 37, 44, 37, 32, 44, 34, 30, 57, 43, 64, 57, 30,
+    //         43, 57, 43, 30, 31, 43, 37, 64, 37, 43, 32, 41, 8, 17, 45, 8, 41,
+    //         12, 52, 17, 8, 12, 17, 11, 25, 53, 52, 18, 53, 18, 11, 53, 11,
+    //         18, 5, 12, 18, 52, 18, 12, 8, 66, 34, 57, 66, 62, 34, 64, 66, 57,
+    //         67, 66, 64, 62, 66, 68, 66, 67, 68, 25, 61, 53, 55, 61, 25, 61,
+    //         52, 53, 61, 60, 52, 61, 55, 65, 60, 61, 65, 24, 33, 25, 24, 11,
+    //         16, 11, 24, 25, 33, 24, 34, 30, 24, 16, 24, 30, 34, 54, 51, 63,
+    //         54, 49, 51, 54, 63, 68, 49, 54, 68, 42, 47, 41, 47, 39, 41, 39,
+    //         47, 46, 49, 47, 50, 47, 49, 46, 19, 13, 6, 13, 19, 16, 19, 30,
+    //         16, 30, 19, 31, 13, 9, 6, 9, 13, 16, 11, 9, 16, 9, 11, 5, 36, 27,
+    //         29, 27, 23, 29, 23, 15, 40, 15, 45, 40, 48, 42, 50, 47, 48, 50,
+    //         48, 47, 42, 14, 20, 6, 20, 19, 6, 19, 20, 31, 26, 43, 31, 43, 26,
+    //         32, 20, 26, 31, 26, 20, 14, 14, 21, 32, 27, 21, 23, 21, 27, 32,
+    //         32, 35, 38, 27, 35, 32, 38, 35, 36, 35, 27, 36, 3, 1, 6, 9, 3, 6,
+    //         3, 9, 5, 18, 2, 5, 2, 18, 8, 2, 3, 5, 3, 2, 1, 1, 10, 6, 21, 10,
+    //         23, 10, 14, 6, 10, 21, 14, 22, 8, 45, 15, 22, 45, 22, 15, 8, 28,
+    //         14, 32, 26, 28, 32, 28, 26, 14, 1, 4, 8, 4, 2, 8, 2, 4, 1, 7, 1,
+    //         8, 7, 10, 1, 15, 7, 8, 7, 15, 23, 10, 7, 23;
+
+    // hullFaces = hullFaces - Eigen::MatrixXi::Ones(numTriangles, 3);
+    Eigen::MatrixXd hullNormals(numTriangles, 3);
+    for (int i = 0; i < numVertices; ++i) {
+        X.row(i) = hullV[i];
+    }
+    // hullFaces << 2, 1, 0, 1, 3, 0, 3, 2, 0, 2, 3, 1;
+    for (int i = 0; i < numTriangles; ++i) {
+        hullFaces.row(i) = hullT[i];
+        hullNormals.row(i) = -normalToFace(hullFaces.row(i), X).transpose();
+    }
+
+    Eigen::MatrixXd hullEdges(6, 7);
+
+    // hullEdges << 0, 1, 0, 1, 0.707107, 0.707107, 0, 0, 2, 2, 0, 0.707107, 0,
+    //         0.707107, 0, 3, 1, 2, 0, 0.707107, 0.707107, 1, 2, 0, 3, 0,
+    //         -0.707107, 0.707107, 1, 3, 3, 1, -0.707107, 0, 0.707107, 2, 3, 2,
+    //         3, -0.707107, 0.707107, 0;
+    listEdges(hullFaces, X, hullEdges);
+
+    std::vector<std::vector<int>> hullNodes;
+    nodeToFaces(hullFaces, X, hullNodes);
+    // std::vector<int> F = {1, 0, 2};
+    // hullNodes.push_back(F);
+    // F = {0, 1, 3};
+    // hullNodes.push_back(F);
+    // F = {2, 0, 3};
+    // hullNodes.push_back(F);
+    // F = {1, 2, 3};
+    // hullNodes.push_back(F);
+
+    int i0 = 1;
+    int j0 = 0;
+    int nEdges = hullEdges.rows();
+    double Vopt = std::numeric_limits<double>::max();
+
+    // Variables to store minimal volume and corresponding OBB
+    Eigen::Matrix3d min_R;
+    Eigen::Vector3d min_extent;
+    Eigen::Vector3d min_center;
+    // double phi = 0;
+
+    // Loop over edges to find the minimal bounding box
+    for (int i = i0; i < std::max(nEdges, i0); ++i) {
+        Eigen::Matrix<double, 2, 3> normal1 =
+                hullNormals(hullEdges.row(i).segment<2>(2).array(),
+                            Eigen::placeholders::all);
+        Eigen::RowVector3d real_mean_normal1 = normal1.colwise().mean();
+
+        Eigen::RowVector3d real_e1 =
+                hullEdges.row(i).segment<3>(4).normalized();
+
+        // Loop over edges j
+        for (int j = j0; j < std::min(i, nEdges); ++j) {
+            Eigen::Matrix<double, 2, 3> normal2 =
+                    hullNormals(hullEdges.row(j).segment<2>(2).array(),
+                                Eigen::placeholders::all);
+            Eigen::RowVector3d real_mean_normal2 = normal2.colwise().mean();
+            Eigen::RowVector3d real_e2 =
+                    hullEdges.row(j).segment<3>(4).normalized();
+
+            double phi;
+            Eigen::Matrix3d R_x1;
+            Eigen::VectorXd theta1_min;
+            Eigen::VectorXd theta1_max;
+            int rc1;
+            computeTheta(real_e1, real_e2, tol, normal1, normal2,
+                         real_mean_normal1, phi, R_x1, theta1_min, theta1_max,
+                         rc1);
+
+            if (std::abs(phi) < tol * 1e6) {
+                continue;
+            }
+
+            for (int k = 0; k < theta1_min.size(); ++k) {
+                Eigen::Matrix3d R_x = R_x1;
+                Eigen::RowVector3d mean_normal1 = real_mean_normal1;
+                Eigen::RowVector3d mean_normal2 = real_mean_normal2;
+                Eigen::RowVector3d e1 = real_e1;
+                Eigen::RowVector3d e2 = real_e2;
+                Eigen::RowVector3d x = R_x.row(0);
+                Eigen::RowVector3d z = R_x.row(2);
+
+                // Declaration of some useful arrays
+                Eigen::RowVector4i p1 = -Eigen::RowVector4i::Ones();
+                Eigen::RowVector4i p2 = -Eigen::RowVector4i::Ones();
+                Eigen::RowVector4d theta1_p2 =
+                        Eigen::RowVector4d::Constant(theta1_max(k) + 2 * tol);
+
+                std::array<std::vector<int>, 4> nodes_p2;
+                std::array<std::vector<int>, 4> nodeExt;
+
+                Eigen::RowVector4i nextNodeExt = -Eigen::RowVector4i::Ones();
+
+                // Compute the smallest bounding box oriented along the axis
+                // determined by the first theta1
+                double theta1 = theta1_min(k);
+                Eigen::Matrix3d R_n;
+                computeR_n(theta1, phi, R_x, mean_normal2, R_n);
+
+                // Rotate points to this orientation
+                Eigen::MatrixXd X_n = X * R_n.transpose();  // (N*3)
+                Eigen::RowVector3d minX_n;
+                Eigen::RowVector3d maxX_n;
+                Eigen::RowVector3i nodeMin;
+                Eigen::RowVector3i nodeMax;
+
+                // Compute min and max for each column:
+                for (int col = 0; col < X_n.cols(); ++col) {
+                    double min_val = std::numeric_limits<double>::infinity();
+                    double max_val = -std::numeric_limits<double>::infinity();
+                    int min_idx = -1;
+                    int max_idx = -1;
+                    for (int row = 0; row < X_n.rows(); ++row) {
+                        double val = X_n(row, col);
+                        if (val < min_val) {
+                            min_val = val;
+                            min_idx = row;
+                        }
+                        if (val > max_val) {
+                            max_val = val;
+                            max_idx = row;
+                        }
+                    }
+                    minX_n(col) = min_val;
+                    nodeMin(col) = min_idx;
+                    maxX_n(col) = max_val;
+                    nodeMax(col) = max_idx;
+                }
+
+                double V = (maxX_n - minX_n).prod();
+                if (V < 0)
+                    std::cout << "--------------> = " << maxX_n - minX_n
+                              << std::endl;
+
+                if (V < Vopt) {
+                    // Update the optimal volume and rotation
+                    min_R = R_n;
+                    Vopt = V;
+                    min_extent = maxX_n - minX_n;
+                    min_center = 0.5 * (minX_n + maxX_n);
+                }
+
+                // prevNodeExt = [nodeMin nodeMax(3)]
+                Eigen::RowVector4i prevNodeExt;
+                prevNodeExt.head<3>() = nodeMin;
+                prevNodeExt(3) = nodeMax(2);
+
+                // Compute nodeExt
+                for (int l = 0; l < 3; ++l) {
+                    nodeExt[l].clear();
+                    double threshold =
+                            minX_n(l) +
+                            tol * 1e2 * std::max(std::abs(minX_n(l)), 1.0);
+                    for (int idx = 0; idx < X_n.rows(); ++idx) {
+                        if (X_n(idx, l) <= threshold) {
+                            nodeExt[l].push_back(idx);
+                        }
+                    }
+                }
+
+                nodeExt[3].clear();
+                double threshold =
+                        maxX_n(2) -
+                        tol * 1e2 * std::max(std::abs(maxX_n(2)), 1.0);
+                for (int idx = 0; idx < X_n.rows(); ++idx) {
+                    if (X_n(idx, 2) >= threshold) {
+                        nodeExt[3].push_back(idx);
+                    }
+                }
+
+                // Loop on all theta1 crossing an edge on the Gaussian sphere
+                while (theta1 < theta1_max(k) + tol) {
+                    // std::endl; Computation of the p2's for -n1, -n2, -n3 and
+                    // +n3
+                    for (int n = 0; n < 4; ++n) {
+                        if (p2(n) == -1) {
+                            for (size_t m = 0; m < nodeExt[n].size(); ++m) {
+                                int nodeIdx = nodeExt[n][m];
+                                std::vector<int> faces = hullNodes[nodeIdx];
+                                int nFaces = faces.size();
+                                if (nFaces > 0) {
+                                    if ((n == 2) != (phi > 0)) {
+                                        std::reverse(faces.begin(),
+                                                     faces.end());
+                                    }
+
+                                    int nIter = (n <= 1) ? nFaces : nFaces + 1;
+
+                                    // Find l0
+                                    int l0 = 0;
+                                    if (p1(n) > -1) {
+                                        auto it = std::find(faces.begin(),
+                                                            faces.end(), p1(n));
+                                        if (it != faces.end()) {
+                                            l0 = std::distance(faces.begin(),
+                                                               it);
+                                            if (n <= 1) {
+                                                l0 += 1;
+                                            }
+                                        } else {
+                                            l0 = 0;
+                                        }
+                                    }
+
+                                    // Inner loop over ll
+                                    Eigen::RowVector3d intersection, newN1;
+                                    Eigen::Matrix<double, 2, 3> normals;
+                                    for (int ll = 0; ll < nIter; ++ll) {
+                                        int l = (l0 + ll) % nFaces;
+                                        Eigen::RowVector3i face =
+                                                hullFaces.row(faces[l]);
+
+                                        // Get normals
+                                        normals.row(0) =
+                                                hullNormals.row(faces[l]);
+                                        if ((n == 2) != (phi > 0)) {
+                                            normals.row(1) = hullNormals.row(
+                                                    faces[((l - 1 + nFaces) %
+                                                           nFaces)]);  // avant
+                                        } else {
+                                            normals.row(1) = hullNormals.row(
+                                                    faces[((l + 1) %
+                                                           nFaces)]);  // apres
+                                        }
+
+                                        // Find idxNode
+                                        int idxNode = -1;
+                                        for (int idx = 0; idx < 3; ++idx) {
+                                            if (face(idx) == nodeIdx) {
+                                                idxNode = idx;
+                                                break;
+                                            }
+                                        }
+
+                                        // Define edge
+                                        int edge0 = face(idxNode);
+                                        int edge1 = face((idxNode + 1) % 3);
+                                        Eigen::Vector2i edge;
+                                        edge << edge0, edge1;
+
+                                        // Compute vector a
+                                        Eigen::RowVector3d a =
+                                                X.row(edge(1)) - X.row(edge(0));
+
+                                        if (a.norm() < tol) {
+                                            continue;
+                                        }
+
+                                        // Depending on n, compute c and newN1
+                                        Eigen::RowVector3d c_vec;
+                                        double sigma;
+
+                                        if (n == 0) {
+                                            c_vec = a.cross(e1);
+                                            if (c_vec.norm() / a.norm() > tol) {
+                                                sigma = -std::copysign(
+                                                        1.0,
+                                                        c_vec.dot(R_n.row(0)));
+                                                if (std::abs(sigma) < tol)
+                                                    sigma = 1.0;
+                                                intersection =
+                                                        sigma *
+                                                        c_vec.normalized();
+                                            } else {
+                                                continue;
+                                            }
+                                            newN1 = -intersection;
+                                        } else {
+                                            if (n == 1) {
+                                                c_vec = a.cross(e2);
+                                                if (c_vec.norm() / a.norm() >
+                                                    tol) {
+                                                    sigma = -std::copysign(
+                                                            1.0,
+                                                            c_vec.dot(R_n.row(
+                                                                    1)));
+                                                    if (std::abs(sigma) < tol)
+                                                        sigma = 1.0;
+                                                    intersection =
+                                                            sigma *
+                                                            c_vec.normalized();
+                                                } else {
+                                                    continue;
+                                                }
+
+                                                // Compute c_vec again
+                                                c_vec = intersection.cross(e1);
+                                                if (c_vec.norm() /
+                                                            intersection
+                                                                    .norm() >
+                                                    tol) {
+                                                    sigma = std::copysign(
+                                                            1.0,
+                                                            c_vec.dot(R_n.row(
+                                                                    0)));
+                                                    if (std::abs(sigma) < tol)
+                                                        sigma = 1.0;
+                                                    newN1 = sigma *
+                                                            c_vec.normalized();
+                                                } else {
+                                                    continue;
+                                                }
+
+                                            } else {
+                                                Eigen::RowVector3d edge_x =
+                                                        a * R_x.transpose();
+                                                double a_val = edge_x(0) *
+                                                               std::cos(phi) /
+                                                               2.0;
+                                                double b_val = -edge_x(1) *
+                                                               std::cos(phi) /
+                                                               2.0;
+                                                double c_val = edge_x(2) *
+                                                               std::sin(phi);
+
+                                                double psi = std::atan2(b_val,
+                                                                        a_val);
+                                                double r = std::sqrt(
+                                                        a_val * a_val +
+                                                        b_val * b_val);
+
+                                                if (std::abs(r) <
+                                                    std::max(std::abs(c_val -
+                                                                      b_val),
+                                                             tol)) {
+                                                    continue;
+                                                }
+
+                                                double temp =
+                                                        (c_val - b_val) / r;
+                                                temp = std::clamp(
+                                                        temp, -1.0,
+                                                        1.0);  // Ensure value
+                                                               // is within [-1,
+                                                               // 1]
+                                                double asin_val =
+                                                        std::asin(temp);
+
+                                                Eigen::Vector4d theta1inter;
+                                                theta1inter(0) =
+                                                        0.5 * (asin_val - psi);
+                                                theta1inter(1) =
+                                                        0.5 *
+                                                        (M_PI - asin_val - psi);
+
+                                                theta1inter(0) = matlab_mod(
+                                                        theta1inter(0),
+                                                        2 * M_PI);
+
+                                                theta1inter(1) = matlab_mod(
+                                                        theta1inter(1),
+                                                        2 * M_PI);
+
+                                                theta1inter(2) = matlab_mod(
+                                                        theta1inter(0) + M_PI,
+                                                        2 * M_PI);
+
+                                                theta1inter(3) = matlab_mod(
+                                                        theta1inter(1) + M_PI,
+                                                        2 * M_PI);
+
+                                                // Adjust theta1inter if
+                                                // mean_normal1.dot(x) >= 0
+                                                if (mean_normal1.dot(x) >= 0) {
+                                                    theta1inter.array() -= M_PI;
+                                                }
+
+                                                std::vector<int> idxTh1;
+                                                for (int i = 0; i < 4; ++i) {
+                                                    if (theta1inter(i) >
+                                                        theta1) {
+                                                        idxTh1.push_back(i);
+                                                    }
+                                                }
+
+                                                // Set theta1inter accordingly
+                                                double theta1inter_val;
+                                                if (idxTh1.empty()) {
+                                                    theta1inter_val =
+                                                            theta1inter
+                                                                    .minCoeff();
+                                                } else {
+                                                    theta1inter_val =
+                                                            std::numeric_limits<
+                                                                    double>::
+                                                                    max();
+                                                    for (int idx : idxTh1) {
+                                                        if (theta1inter(idx) <
+                                                            theta1inter_val) {
+                                                            theta1inter_val =
+                                                                    theta1inter(
+                                                                            idx);
+                                                        }
+                                                    }
+                                                }
+
+                                                // Compute newR_n
+                                                Eigen::Matrix3d newR_n;
+                                                computeR_n(theta1inter_val, phi,
+                                                           R_x, mean_normal2,
+                                                           newR_n);
+
+                                                newN1 = newR_n.row(0);
+                                                intersection =
+                                                        (2.0 * n - 5.0) *
+                                                        newR_n.row(
+                                                                2);  // BUG ???
+                                            }
+                                        }
+                                        Eigen::MatrixXd a1(2, 3);
+                                        Eigen::MatrixXd b1(2, 3);
+                                        Eigen::MatrixXd c1(2, 3);
+                                        if ((n <= 1) or (ll > 0) or
+                                            (std::abs((X.row(edge(1)) -
+                                                       X.row(edge(0))) *
+                                                      R_n.row(2).transpose()) >
+                                             tol)) {
+                                            // a = [normals(1,:); intersection];
+                                            a1.row(0) = normals.row(0);
+                                            a1.row(1) = intersection;
+                                        } else {
+                                            // a = [(2*n-7)*R_n(3,:);
+                                            // intersection];
+                                            a1.row(0) = (2.0 * n - 5.0) *
+                                                        R_n.row(2);
+                                            a1.row(1) = intersection;
+                                        }
+
+                                        b1.row(0) = intersection;
+                                        b1.row(1) = normals.row(1);
+
+                                        Eigen::RowVector3d temp1, temp2;
+
+                                        temp1 = a1.row(0);
+                                        temp2 = b1.row(0);
+                                        c1.row(0) = temp1.cross(temp2);
+                                        temp1 = a1.row(1);
+                                        temp2 = b1.row(1);
+                                        c1.row(1) = temp1.cross(temp2);
+
+                                        // Compute norm(diff(a)) < tol
+                                        Eigen::RowVector3d diff_a =
+                                                a1.row(1) - a1.row(0);
+                                        double norm_diff_a = diff_a.norm();
+
+                                        // Determine testBinary
+                                        bool testBinary;
+                                        if (norm_diff_a < tol) {
+                                            testBinary = true;
+                                        } else {
+                                            // Compute c(1,:)*c(2,:)' >= -tol
+                                            // In C++, c.row(0) is the first
+                                            // row, c.row(1) is the second row
+                                            double dot_product =
+                                                    c1.row(0).dot(c1.row(1));
+                                            testBinary = (dot_product >= -tol);
+                                        }
+
+                                        if (testBinary) {
+                                            Eigen::RowVector3d aa = R_n.row(0);
+                                            Eigen::RowVector3d bb = newN1;
+                                            Eigen::RowVector3d cc =
+                                                    aa.cross(bb);
+
+                                            double sinDtheta1 = cc.dot(z);
+                                            if (std::abs(sinDtheta1) < tol) {
+                                                sinDtheta1 = 0.0;
+                                            }
+                                            double cosDtheta1 = aa.dot(bb);
+                                            double dtheta1 = std::atan2(
+                                                    sinDtheta1, cosDtheta1);
+
+                                            if (dtheta1 > tol) {
+                                                double nextTheta1 =
+                                                        std::min(
+                                                                theta1 +
+                                                                        dtheta1,
+                                                                theta1_p2(n)) -
+                                                        tol;
+
+                                                Eigen::Matrix3d midR_n;
+                                                computeR_n(0.5 * (theta1 +
+                                                                  nextTheta1),
+                                                           phi, R_x,
+                                                           mean_normal2,
+                                                           midR_n);
+
+                                                Eigen::Matrix3d nextR_n;
+                                                computeR_n(nextTheta1, phi, R_x,
+                                                           mean_normal2,
+                                                           nextR_n);
+
+                                                // Compute delta values
+                                                double delta, delta2 = 1.0,
+                                                              delta3;
+
+                                                if (n <= 2) {
+                                                    delta = -(
+                                                            X.row(edge(0)).dot(
+                                                                    midR_n.row(
+                                                                            n)) -
+                                                            X.row(prevNodeExt(
+                                                                          n))
+                                                                    .dot(midR_n.row(
+                                                                            n)));
+                                                    if (p2(n) > -1) {
+                                                        delta2 = -(
+                                                                X.row(edge(1)).dot(
+                                                                        nextR_n.row(
+                                                                                n)) -
+                                                                X.row(nextNodeExt(
+                                                                              n))
+                                                                        .dot(nextR_n.row(
+                                                                                n)));
+                                                    }
+                                                    delta3 = -(
+                                                            X.row(edge(1)).dot(
+                                                                    midR_n.row(
+                                                                            n)) -
+                                                            X.row(edge(0)).dot(
+                                                                    midR_n.row(
+                                                                            n)));
+                                                } else {
+                                                    delta = -(
+                                                            -X.row(prevNodeExt(
+                                                                           n))
+                                                                     .dot(midR_n.row(
+                                                                             2)) +
+                                                            X.row(edge(0)).dot(
+                                                                    midR_n.row(
+                                                                            2)));
+                                                    if (p2(n) > -1) {
+                                                        delta2 = -(
+                                                                -X.row(nextNodeExt(
+                                                                               n))
+                                                                         .dot(nextR_n.row(
+                                                                                 2)) +
+                                                                X.row(edge(1)).dot(
+                                                                        nextR_n.row(
+                                                                                2)));
+                                                    }
+                                                    delta3 =
+                                                            (-X.row(edge(0)).dot(
+                                                                     midR_n.row(
+                                                                             2)) +
+                                                             X.row(edge(1)).dot(
+                                                                     midR_n.row(
+                                                                             2)));
+                                                }
+
+                                                if (p2(n) == -1 || p1(n) > -1 ||
+                                                    (p1(n) == -1 &&
+                                                     p2(n) > -1 &&
+                                                     (theta1 + dtheta1 <
+                                                              theta1_p2(n) -
+                                                                      tol ||
+                                                      (delta >= 0 &&
+                                                       delta2 > -tol &&
+                                                       delta3 < tol)))) {
+                                                    if (theta1 + dtheta1 <
+                                                                theta1_max(k) &&
+                                                        (delta >= 0 &&
+                                                         delta2 > -tol &&
+                                                         delta3 < tol)) {
+                                                        prevNodeExt(n) =
+                                                                edge(0);
+                                                        int prevNodeExt_n =
+                                                                prevNodeExt(n);
+                                                        if ((n == 2) !=
+                                                            (phi > 0)) {
+                                                            p2(n) = faces
+                                                                    [(l - 1 +
+                                                                      nFaces) %
+                                                                     nFaces];
+
+                                                        } else {
+                                                            p2(n) = faces
+                                                                    [(l + 1) %
+                                                                     nFaces];
+                                                        }
+
+                                                        theta1_p2(n) = theta1 +
+                                                                       dtheta1;
+
+                                                        // Adjust intersection
+                                                        Eigen::RowVector3d tt =
+                                                                normals.colwise()
+                                                                        .mean();
+
+                                                        intersection *= std::copysign(
+                                                                1.0,
+                                                                intersection.dot(
+                                                                        tt));
+
+                                                        nodes_p2[n] = findEquivalentExtrema(
+                                                                intersection,
+                                                                edge(1),
+                                                                hullFaces,
+                                                                hullNodes, X,
+                                                                tol * 1e2,
+                                                                prevNodeExt_n);
+
+                                                        nextNodeExt(n) =
+                                                                edge(1);
+
+                                                        if (nextNodeExt(n) ==
+                                                            -1) {
+                                                            throw std::
+                                                                    runtime_error(
+                                                                            "ne"
+                                                                            "xt"
+                                                                            "No"
+                                                                            "de"
+                                                                            "Ex"
+                                                                            "t("
+                                                                            "n)"
+                                                                            " i"
+                                                                            "s "
+                                                                            "ze"
+                                                                            "r"
+                                                                            "o");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }  // End of testBinary
+                                    }  // End of inner loop over ll
+                                }
+                            }
+                        }
+
+                        // Handle case when p2(n) == 0 after loop
+                        if (p2(n) == -1) {
+                            Eigen::MatrixXd X_n(X.rows(), 3);
+                            X_n = X * R_n.transpose();
+
+                            Eigen::MatrixXd x_n(X.rows(), 3);
+                            Eigen::Matrix3d R_xn;
+                            computeR_n(theta1_max(k), phi, R_x, mean_normal2,
+                                       R_xn);
+                            x_n = X * R_xn.transpose();
+
+                            if (n <= 2) {
+                                double minX_n = X_n.col(n).minCoeff();
+                                int nodemin;
+                                x_n.col(n).minCoeff(&nodemin);
+                                double threshold =
+                                        minX_n +
+                                        tol * std::max(1e3 * std::abs(minX_n),
+                                                       1.0);
+                                if (X_n(nodemin, n) < threshold) {
+                                    prevNodeExt(n) = nodemin;
+                                }
+                            } else {
+                                double maxX_n = X_n.col(2).maxCoeff();
+                                int nodemax;
+                                x_n.col(2).maxCoeff(&nodemax);
+                                double threshold =
+                                        maxX_n -
+                                        tol * std::max(1e3 * std::abs(maxX_n),
+                                                       1.0);
+                                if (X_n(nodemax, 2) > threshold) {
+                                    prevNodeExt(3) = nodemax;
+                                }
+                            }
+                        }
+
+                    }  // End of loop over n
+
+                    // Update p2 and compute theta1_new
+                    for (int idx = 0; idx < 4; ++idx) {
+                        if (p2(idx) == -1) {
+                            p2(idx) = -2;
+                        }
+                    }
+                    double theta1_new =
+                            std::min(theta1_p2.minCoeff(), theta1_max(k));
+
+                    // Find indices to update
+                    std::vector<int> update_indices;
+                    for (int idx = 0; idx < 4; ++idx) {
+                        if (theta1_p2(idx) <= theta1_new + tol) {
+                            update_indices.push_back(idx);
+                        }
+                    }
+
+                    // Update p1, p2, theta1_p2
+                    for (int idx : update_indices) {
+                        p1(idx) = p2(idx);
+                        p2(idx) = -1;
+                        theta1_p2(idx) = theta1_max(k) + 2 * tol;
+                    }
+
+                    // Find the minimum volume within the range (theta1,
+                    // theta1_new] Compute X_Min and X_Max
+                    Eigen::Matrix3d X_Min;
+                    Eigen::Matrix3d X_Max;
+                    for (int idx = 0; idx < 3; ++idx) {
+                        X_Min.row(idx) = X.row(prevNodeExt(idx));
+                    }
+                    X_Max.row(0) = X.row(static_cast<int>(hullEdges(i, 0)));
+                    X_Max.row(1) = X.row(static_cast<int>(hullEdges(j, 0)));
+                    X_Max.row(2) = X.row(prevNodeExt(3));
+
+                    Eigen::Matrix3d c = X_Max - X_Min;
+                    Eigen::RowVector3d c1 = c.row(0) - (c.row(0).dot(e1)) * e1;
+                    double gamma1 = -std::acos(-c1.dot(x) / c1.norm());
+                    Eigen::RowVector3d c2 = c.row(1) - (c.row(1).dot(e2)) * e2;
+                    Eigen::RowVector3d cross_x_c2 = x.cross(c2);
+                    double gamma2 =
+                            M_PI - std::asin(cross_x_c2.dot(e2) / c2.norm());
+                    Eigen::RowVector3d c3 = c.row(2) * R_x.transpose();
+
+                    // Compute sign of sin(phi)
+                    double sin_gamma1 = std::sin(gamma1);
+                    double cos_gamma1 = std::cos(gamma1);
+                    double sin_gamma2 = std::sin(gamma2);
+                    double cos_gamma2 = std::cos(gamma2);
+                    double sin_phi = std::sin(phi);
+                    double cos_phi = std::cos(phi);
+                    double sin_phi_sign =
+                            (sin_phi > 0) -
+                            (sin_phi <
+                             0);  // Equivalent to MATLAB's sign(sin(phi))
+
+                    // Compute num
+                    Eigen::Vector3d num_0;
+                    Eigen::Vector4d num_1, num_2, deriv;
+                    Eigen::VectorXd num_3(5), num_4(5), num_5(8), num_6(8),
+                            num_7(8), num_8(8), num_9(8), num(8);
+
+                    num_0(0) = sin_phi_sign * (c3(2) * sin_phi);
+                    num_0(1) = sin_phi_sign * (-c3(0) * cos_phi);
+                    num_0(2) =
+                            sin_phi_sign * (c3(1) * cos_phi + c3(2) * sin_phi);
+
+                    // Extend num and compute new num
+                    num_1.setZero();
+                    num_1.head(3) = num_0 * sin_gamma1;
+
+                    num_2.setZero();
+                    num_2.tail(3) = num_0 * cos_gamma1;
+                    num_2 = num_1 + num_2;
+
+                    num_3.setZero();
+                    num_3.head(4) = num_2 * cos_gamma2 * sin_phi;
+
+                    num_4.setZero();
+                    num_4.tail(4) = num_2;
+                    num_4 = num_3 + num_4 * sin_gamma2;
+
+                    deriv(0) = 4 * num_4(0);
+                    deriv(1) = 3 * num_4(1);
+                    deriv(2) = 2 * num_4(2);
+                    deriv(3) = num_4(3);
+
+                    // Prepare polynomials for further computations
+                    // num = [deriv 0 0 0 0]*sin(phi)^2 + [0 0 deriv 0
+                    // 0]*(sin(phi)^2 + 1) + [0 0 0 0 deriv] -
+                    // (4*sin(phi)^2*[num 0 0 0] + 2*(sin(phi)^2 + 1)*[0 0 num
+                    // 0]);
+
+                    num_5.setZero();
+                    num_5.head(4) = deriv * std::pow(sin_phi, 2);
+
+                    num_6.setZero();
+                    num_6.segment<4>(2) = deriv * (std::pow(sin_phi, 2) + 1.0);
+
+                    num_7.setZero();
+                    num_7.tail(4) = deriv;
+
+                    num_8.setZero();
+                    num_8.head(5) = 4 * num_4 * std::pow(sin_phi, 2);
+
+                    num_9.setZero();
+                    num_9.segment<5>(2) =
+                            2 * num_4 * (std::pow(sin_phi, 2) + 1.0);
+
+                    num = num_5 + num_6 + num_7 - num_8 - num_9;
+
+                    // Find real roots of the polynomial
+                    std::vector<double> rootsNum;
+
+                    // Since Eigen doesn't have a built-in roots solver, you can
+                    // use a polynomial root-finding library Alternatively, for
+                    // polynomials up to degree 4, you can implement analytical
+                    // solutions For this example, we'll assume you have a
+                    // function to compute the roots of a polynomial
+                    rootsNum = findRealRoots(num);
+
+                    // Compute theta1Local
+                    std::vector<double> theta1Local;
+                    for (double root : rootsNum) {
+                        // Check if root is real (already ensured)
+                        double theta = std::atan(root);
+                        theta = matlab_mod(theta, M_PI) - M_PI;
+                        if (theta >= theta1) {
+                            theta1Local.push_back(theta);
+                        }
+                    }
+
+                    std::vector<double> theta1_;
+                    for (double theta1local : theta1Local) {
+                        // Check if root is real (already ensured)
+                        if (theta1local < theta1_new) {
+                            theta1_.push_back(theta1local);
+                        }
+                    }
+
+                    // Add theta1_new to theta1_
+                    theta1_.push_back(theta1_new);
+
+                    // Iterate over theta1_
+                    for (size_t m = 0; m < theta1_.size(); ++m) {
+                        double theta1_m = theta1_[m];
+                        computeR_n(theta1_m, phi, R_x, mean_normal2, R_n);
+
+                        if (m < (theta1_.size() - 1)) {
+                            // Compute V using X_Max and X_Min
+                            Eigen::VectorXd diagDiff =
+                                    (X_Max * R_n.transpose()).diagonal() -
+                                    (X_Min * R_n.transpose()).diagonal();
+
+                            double V = diagDiff.prod();
+                            if (V < 0)
+                                std::cout << "--------------> diagDiff = "
+                                          << diagDiff << std::endl;
+
+                            if (V < Vopt) {
+                                min_R = R_n;
+                                Vopt = V;
+                                min_extent = diagDiff;
+                                min_center =
+                                        0.5 *
+                                        ((X_Max * R_n.transpose()).diagonal() +
+                                         (X_Min * R_n.transpose()).diagonal());
+                            }
+                        } else {
+                            // Update X_Min and X_Max with nextNodeExt
+                            std::vector<int> indicesMin = {prevNodeExt(0),
+                                                           prevNodeExt(1),
+                                                           prevNodeExt(2)};
+                            for (int idx = 0; idx < 3; ++idx) {
+                                if (nextNodeExt(idx) > -1) {
+                                    indicesMin.push_back(nextNodeExt(idx));
+                                }
+                            }
+                            Eigen::MatrixXd X_Min_updated(indicesMin.size(), 3);
+                            for (size_t idx = 0; idx < indicesMin.size();
+                                 ++idx) {
+                                X_Min_updated.row(idx) = X.row(indicesMin[idx]);
+                            }
+                            X_Min_updated = X_Min_updated * R_n.transpose();
+
+                            // Update X_Max with edges and nodes
+                            std::vector<int> indicesMax = {
+                                    static_cast<int>(hullEdges(i, 0)),
+                                    static_cast<int>(hullEdges(i, 1)),
+                                    static_cast<int>(hullEdges(j, 0)),
+                                    static_cast<int>(hullEdges(j, 1)),
+                                    prevNodeExt(3)};
+                            if (nextNodeExt(3) > -1) {
+                                indicesMax.push_back(nextNodeExt(3));
+                            }
+
+                            Eigen::MatrixXd X_Max_updated(indicesMax.size(), 3);
+                            for (size_t idx = 0; idx < indicesMax.size();
+                                 ++idx) {
+                                X_Max_updated.row(idx) = X.row(indicesMax[idx]);
+                            }
+                            X_Max_updated = X_Max_updated * R_n.transpose();
+
+                            // Compute V
+                            Eigen::RowVectorXd X_Max_rowwise =
+                                    X_Max_updated.colwise().maxCoeff();
+                            Eigen::RowVectorXd X_Min_rowwise =
+                                    X_Min_updated.colwise().minCoeff();
+
+                            double V = (X_Max_rowwise - X_Min_rowwise).prod();
+
+                            if (V < 0) {
+                                std::cout << "--------------> X_Max_updated = "
+                                          << X_Max_updated << std::endl;
+                                std::cout << "--------------> X_Min_updated = "
+                                          << X_Min_updated << std::endl;
+                                std::cout << "--------------> rowwise = "
+                                          << X_Max_rowwise - X_Min_rowwise
+                                          << std::endl;
+                            }
+
+                            if (V < Vopt) {
+                                min_R = R_n;
+                                Vopt = V;
+                                min_extent = X_Max_rowwise - X_Min_rowwise;
+                                min_center =
+                                        0.5 * (X_Max_rowwise + X_Min_rowwise);
+                            }
+                        }
+                    }
+
+                    // Update nodeExt and prevNodeExt
+                    for (size_t m = 0; m < update_indices.size(); ++m) {
+                        int n = update_indices[m];
+                        nodeExt[n] = nodes_p2[n];
+                        prevNodeExt(n) = nextNodeExt(n);
+                    }
+
+                    // Update theta1 for the next iteration
+                    theta1 = theta1_new + tol;
+
+                }  // End of while loop
+            }  // End of loop over k
+        }
+    }
+
+    Vopt = Vopt * std::pow(normFactor, 3);
+
+    // If no better bounding box was found, return the default OBB
+    if (Vopt == std::numeric_limits<double>::max()) {
+        utility::LogError("Failed to find minimal oriented bounding box.");
+        return OrientedBoundingBox();
+    }
+
+    // Scale back to original dimensions
+    min_center *= normFactor;
+    min_extent *= normFactor;
+    min_center += mean;
+
+    // Create the OrientedBoundingBox with the minimal volume
+    OrientedBoundingBox obb;
+    obb.R_ = min_R;
+    obb.extent_ = min_extent;
+    obb.center_ = min_center;
+    return obb;
+}
+
 AxisAlignedBoundingBox& AxisAlignedBoundingBox::Clear() {
     min_bound_.setZero();
     max_bound_.setZero();
