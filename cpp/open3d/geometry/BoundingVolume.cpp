@@ -18,6 +18,236 @@
 namespace open3d {
 namespace geometry {
 
+OrientedBoundingEllipsoid& OrientedBoundingEllipsoid::Clear() {
+    center_.setZero();
+    radii_.setZero();
+    R_ = Eigen::Matrix3d::Identity();
+    color_.setOnes();
+    return *this;
+}
+
+bool OrientedBoundingEllipsoid::IsEmpty() const { return Volume() <= 0; }
+
+Eigen::Vector3d OrientedBoundingEllipsoid::GetMinBound() const {
+    auto points = GetEllipsoidPoints();
+    return ComputeMinBound(points);
+}
+
+Eigen::Vector3d OrientedBoundingEllipsoid::GetMaxBound() const {
+    auto points = GetEllipsoidPoints();
+    return ComputeMaxBound(points);
+}
+
+Eigen::Vector3d OrientedBoundingEllipsoid::GetCenter() const { return center_; }
+
+AxisAlignedBoundingBox OrientedBoundingEllipsoid::GetAxisAlignedBoundingBox()
+        const {
+    return AxisAlignedBoundingBox::CreateFromPoints(GetEllipsoidPoints());
+}
+
+OrientedBoundingBox OrientedBoundingEllipsoid::GetOrientedBoundingBox(
+        bool) const {
+    return OrientedBoundingBox::CreateFromPoints(GetEllipsoidPoints());
+}
+
+OrientedBoundingBox OrientedBoundingEllipsoid::GetMinimalOrientedBoundingBox(
+        bool robust) const {
+    return OrientedBoundingBox::CreateFromPoints(GetEllipsoidPoints());
+}
+
+OrientedBoundingEllipsoid
+OrientedBoundingEllipsoid::GetOrientedBoundingEllipsoid(bool) const {
+    return *this;
+}
+
+OrientedBoundingEllipsoid& OrientedBoundingEllipsoid::Transform(
+        const Eigen::Matrix4d& transformation) {
+    utility::LogError(
+            "A general transform of an OrientedBoundingEllipsoid is not "
+            "implemented. "
+            "Call Translate, Scale, and Rotate.");
+    return *this;
+}
+
+OrientedBoundingEllipsoid& OrientedBoundingEllipsoid::Translate(
+        const Eigen::Vector3d& translation, bool relative) {
+    if (relative) {
+        center_ += translation;
+    } else {
+        center_ = translation;
+    }
+    return *this;
+}
+
+OrientedBoundingEllipsoid& OrientedBoundingEllipsoid::Scale(
+        const double scale, const Eigen::Vector3d& center) {
+    radii_ *= scale;
+    center_ = scale * (center_ - center) + center;
+    return *this;
+}
+
+OrientedBoundingEllipsoid& OrientedBoundingEllipsoid::Rotate(
+        const Eigen::Matrix3d& R, const Eigen::Vector3d& center) {
+    R_ = R * R_;
+    center_ = R * (center_ - center) + center;
+    return *this;
+}
+
+double OrientedBoundingEllipsoid::Volume() const {
+    return 4 * M_PI * radii_(0) * radii_(1) * radii_(2) / 3.0;
+}
+
+std::vector<Eigen::Vector3d> OrientedBoundingEllipsoid::GetEllipsoidPoints()
+        const {
+    Eigen::Vector3d x_axis = R_ * Eigen::Vector3d(radii_(0), 0, 0);
+    Eigen::Vector3d y_axis = R_ * Eigen::Vector3d(0, radii_(1), 0);
+    Eigen::Vector3d z_axis = R_ * Eigen::Vector3d(0, 0, radii_(2));
+    std::vector<Eigen::Vector3d> points(6);
+    points[0] = center_ + R_ * x_axis;
+    points[1] = center_ - R_ * x_axis;
+    points[2] = center_ + y_axis;
+    points[3] = center_ - y_axis;
+    points[4] = center_ + z_axis;
+    points[5] = center_ - z_axis;
+    return points;
+}
+
+OrientedBoundingEllipsoid OrientedBoundingEllipsoid::CreateFromPoints(
+        const std::vector<Eigen::Vector3d>& points, bool robust) {
+    const int d = 3;  // Dimension for 3D points
+    const int n_points = static_cast<int>(points.size());
+    if (n_points == 0) {
+        throw std::runtime_error("Point set is empty.");
+    }
+
+    auto KhachiyanAlgo = [](const Eigen::MatrixXd& A, double eps,
+                            size_t maxiter, Eigen::MatrixXd& Q,
+                            Eigen::VectorXd& c) -> double {
+        size_t d = A.rows();  // Dimensionality
+        size_t N = A.cols();  // Number of points
+
+        // Initialize uniform weights: p_i = 1/N for all i
+        Eigen::VectorXd p =
+                Eigen::VectorXd::Constant(N, 1.0 / static_cast<double>(N));
+
+        // Lift matrix A to Ap by adding a bottom row of ones
+        Eigen::MatrixXd Ap(d + 1, N);
+        Ap.topRows(d) = A;
+        Ap.row(d).setConstant(1.0);
+
+        double ceps = eps * 2;
+        size_t iter = 0;
+
+        // Main iterative loop
+        while (iter < maxiter && ceps > eps) {
+            // Construct diagonal matrix diag(p)
+            Eigen::MatrixXd dp = Eigen::MatrixXd::Zero(N, N);
+            for (size_t i = 0; i < N; ++i) {
+                dp(i, i) = p(i);
+            }
+
+            // Compute Lambda_p = Ap * diag(p) * Ap^T
+            Eigen::MatrixXd Lambdap = Ap * dp * Ap.transpose();
+
+            // Compute inverse of Lambda_p
+            Eigen::MatrixXd ILp = Lambdap.inverse();
+
+            // Compute M = A_p^T * Lambda_p^{-1} * A_p
+            Eigen::MatrixXd M = Ap.transpose() * (ILp * Ap);
+
+            // Identify maximum diagonal element of M and its index
+            double maxval = 0.0;
+            size_t maxi = 0;
+            for (auto i = 0; i < M.rows(); ++i) {
+                double val = M(i, i);
+                if (val > maxval) {
+                    maxval = val;
+                    maxi = i;
+                }
+            }
+
+            // Compute the step size based on the maximum diagonal element
+            double step_size =
+                    (maxval - d - 1.0) / ((d + 1.0) * (maxval - 1.0));
+
+            // Update weights p
+            Eigen::VectorXd newp = (1.0 - step_size) * p;
+            newp(maxi) += step_size;
+
+            // Compute error as the norm of the change in p
+            ceps = (newp - p).norm();
+            p = newp;
+            ++iter;
+        }
+
+        // After convergence, compute dual parameters Q and c
+        // Recompute diagonal matrix diag(p) with final weights
+        Eigen::MatrixXd dp = Eigen::MatrixXd::Zero(N, N);
+        for (size_t i = 0; i < N; ++i) {
+            dp(i, i) = p(i);
+        }
+
+        // Compute PN = A * diag(p) * A^T
+        Eigen::MatrixXd PN = A * dp * A.transpose();
+
+        // Compute M2 = A * p
+        Eigen::VectorXd M2 = A * p;
+
+        // Compute M3 = M2 * M2^T
+        Eigen::MatrixXd M3 = M2 * M2.transpose();
+
+        // Compute inverse of (PN - M3)
+        Eigen::MatrixXd invert = (PN - M3).inverse();
+
+        // Calculate Q and center c from the inverted matrix and weights
+        Q = invert / static_cast<double>(d);
+        c = A * p;
+
+        return ceps;
+    };
+
+    // Assemble matrix A with dimensions d x n_points, where each column is a
+    // point
+    Eigen::MatrixXd A(d, n_points);
+    for (int i = 0; i < n_points; ++i) {
+        A.col(i) = points[i];
+    }
+
+    // Set parameters for Khachiyan's algorithm
+    double eps = 1e-6;
+    size_t maxiter = 1000;
+
+    // Variables to store the resulting ellipsoid parameters
+    Eigen::MatrixXd Q;
+    Eigen::VectorXd c;
+
+    // Call Khachiyan's algorithm to compute Q (shape matrix) and c (center)
+    KhachiyanAlgo(A, eps, maxiter, Q, c);
+    // Optionally check final_error for convergence quality
+
+    // Use eigen-decomposition on Q to extract axes lengths and orientation
+    // For ellipsoid defined by (x-c)^T Q (x-c) <= 1,
+    // the eigenvectors of Q give orientation directions,
+    // and the axes lengths (radii) are 1/sqrt(eigenvalues).
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigenSolver(Q);
+    if (eigenSolver.info() != Eigen::Success) {
+        throw std::runtime_error("Eigen decomposition failed.");
+    }
+    Eigen::VectorXd eigenvalues = eigenSolver.eigenvalues();
+    Eigen::MatrixXd eigenvectors = eigenSolver.eigenvectors();
+
+    // Compute radii = 1/sqrt(eigenvalues)
+    Eigen::Vector3d radii = (1.0 / eigenvalues.array().sqrt()).matrix();
+
+    // Construct the final oriented bounding ellipsoid
+    OrientedBoundingEllipsoid obel;
+    obel.center_ = c.head<3>();  // center vector of length 3
+    obel.R_ = eigenvectors;      // orientation matrix
+    obel.radii_ = radii;         // ellipsoid radii
+
+    return obel;
+}
+
 OrientedBoundingBox& OrientedBoundingBox::Clear() {
     center_.setZero();
     extent_.setZero();
@@ -51,6 +281,11 @@ OrientedBoundingBox OrientedBoundingBox::GetOrientedBoundingBox(bool) const {
 OrientedBoundingBox OrientedBoundingBox::GetMinimalOrientedBoundingBox(
         bool) const {
     return *this;
+}
+
+OrientedBoundingEllipsoid OrientedBoundingBox::GetOrientedBoundingEllipsoid(
+        bool) const {
+    return OrientedBoundingEllipsoid::CreateFromPoints(GetBoxPoints());
 }
 
 OrientedBoundingBox& OrientedBoundingBox::Transform(
@@ -254,6 +489,11 @@ OrientedBoundingBox AxisAlignedBoundingBox::GetOrientedBoundingBox(
 OrientedBoundingBox AxisAlignedBoundingBox::GetMinimalOrientedBoundingBox(
         bool robust) const {
     return OrientedBoundingBox::CreateFromAxisAlignedBoundingBox(*this);
+}
+
+OrientedBoundingEllipsoid AxisAlignedBoundingBox::GetOrientedBoundingEllipsoid(
+        bool) const {
+    return OrientedBoundingEllipsoid::CreateFromPoints(GetBoxPoints());
 }
 
 AxisAlignedBoundingBox::AxisAlignedBoundingBox(const Eigen::Vector3d& min_bound,

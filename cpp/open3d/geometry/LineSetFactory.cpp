@@ -61,6 +61,18 @@ std::shared_ptr<LineSet> LineSet::CreateFromTriangleMesh(
     return line_set;
 }
 
+std::shared_ptr<LineSet> LineSet::CreateFromOrientedBoundingEllipsoid(
+        const OrientedBoundingEllipsoid &ellipsoid) {
+    
+    std::shared_ptr<TriangleMesh> obel = geometry::TriangleMesh::CreateEllipsoid(
+        ellipsoid.radii_(0),
+        ellipsoid.radii_(1),
+        ellipsoid.radii_(2));
+    obel->Translate(ellipsoid.R_.transpose()*ellipsoid.center_);
+    obel->Rotate(ellipsoid.R_, Eigen::Vector3d::Zero());
+    return CreateFromTriangleMesh(*obel);
+}
+
 std::shared_ptr<LineSet> LineSet::CreateFromOrientedBoundingBox(
         const OrientedBoundingBox &box) {
     auto line_set = std::make_shared<LineSet>();

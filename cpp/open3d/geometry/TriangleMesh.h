@@ -619,6 +619,20 @@ public:
             int resolution = 20,
             bool create_uv_map = false);
 
+    /// Factory function to create an ellipsoid mesh (TriangleMeshFactory.cpp)
+    /// The ellipsoid with will be centered at (0, 0, 0).
+    /// \param radius_x defines first radii of the ellipsoid.
+    /// \param radius_y defines second radii of the ellipsoid.
+    /// \param radius_z defines third radii of the ellipsoid.
+    /// \param resolution defines the resolution of the ellipsoid.
+    /// \param create_uv_map add default UV map to the mesh.
+    static std::shared_ptr<TriangleMesh> CreateEllipsoid(
+            double radius_x = 1.0,
+            double radius_y = 1.0,
+            double radius_z = 1.0,
+            int resolution = 20,
+            bool create_uv_map = false);
+
     /// Factory function to create a cylinder mesh (TriangleMeshFactory.cpp)
     /// The axis of the cylinder will be from (0, 0, -height/2) to (0, 0,
     /// height/2). The circle with radius will be split into
