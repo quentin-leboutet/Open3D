@@ -110,11 +110,11 @@ Returns:
             .def_readwrite("color", &OrientedBoundingEllipsoid::color_,
                            "``float64`` array of shape ``(3, )``");
     docstring::ClassMethodDocInject(m, "OrientedBoundingEllipsoid", "volume");
-    docstring::ClassMethodDocInject(
-            m, "OrientedBoundingEllipsoid", "create_from_axis_aligned_bounding_box",
-            {{"aabox",
-              "AxisAlignedBoundingBox object from which OrientedBoundingEllipsoid is "
-              "created."}});
+//     docstring::ClassMethodDocInject(
+//             m, "OrientedBoundingEllipsoid", "create_from_axis_aligned_bounding_box",
+//             {{"aabox",
+//               "AxisAlignedBoundingBox object from which OrientedBoundingEllipsoid is "
+//               "created."}});
 
     auto oriented_bounding_box = static_cast<
             py::class_<OrientedBoundingBox, PyGeometry3D<OrientedBoundingBox>,

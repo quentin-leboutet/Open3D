@@ -114,103 +114,178 @@ std::vector<Eigen::Vector3d> OrientedBoundingEllipsoid::GetEllipsoidPoints()
 
 OrientedBoundingEllipsoid OrientedBoundingEllipsoid::CreateFromPoints(
         const std::vector<Eigen::Vector3d>& points, bool robust) {
-    const int d = 3;  // Dimension for 3D points
-    const int n_points = static_cast<int>(points.size());
-    if (n_points == 0) {
-        throw std::runtime_error("Point set is empty.");
+    // ------------------------------------------------------------
+    // 0) Compute the convex hull of the input point cloud
+    // ------------------------------------------------------------
+    if (points.empty()) {
+        utility::LogError("CreateFromPoints: Input point set is empty.");
+        return OrientedBoundingEllipsoid();
+    }
+    std::shared_ptr<TriangleMesh> hullMesh;
+    std::tie(hullMesh, std::ignore) = Qhull::ComputeConvexHull(points, robust);
+    if (!hullMesh) {
+        utility::LogError("Failed to compute convex hull.");
+        return OrientedBoundingEllipsoid();
     }
 
-    auto KhachiyanAlgo = [](const Eigen::MatrixXd& A, double eps,
-                            size_t maxiter, Eigen::MatrixXd& Q,
-                            Eigen::VectorXd& c) -> double {
-        size_t d = A.rows();  // Dimensionality
-        size_t N = A.cols();  // Number of points
+    // Get convex hull vertices and triangles
+    const std::vector<Eigen::Vector3d>& hullV = hullMesh->vertices_;
+    // const std::vector<Eigen::Vector3i>& hullT = hullMesh->triangles_;
+    const int numVertices = static_cast<int>(hullV.size());
+    // int numTriangles = static_cast<int>(hullT.size());
 
-        // Initialize uniform weights: p_i = 1/N for all i
-        Eigen::VectorXd p =
-                Eigen::VectorXd::Constant(N, 1.0 / static_cast<double>(N));
+    auto mapToClosestIdentity = [&](OrientedBoundingEllipsoid& obel) {
+        Eigen::Matrix3d& R = obel.R_;
+        Eigen::Vector3d& radii = obel.radii_;
+        Eigen::Vector3d col[3] = {R.col(0), R.col(1), R.col(2)};
+        double best_score = -1e9;
+        Eigen::Matrix3d best_R;
+        Eigen::Vector3d best_radii;
+        // Hard-coded permutations of indices [0,1,2]
+        static const std::array<std::array<int, 3>, 6> permutations = {
+                {{{0, 1, 2}},
+                 {{0, 2, 1}},
+                 {{1, 0, 2}},
+                 {{1, 2, 0}},
+                 {{2, 0, 1}},
+                 {{2, 1, 0}}}};
 
-        // Lift matrix A to Ap by adding a bottom row of ones
-        Eigen::MatrixXd Ap(d + 1, N);
-        Ap.topRows(d) = A;
-        Ap.row(d).setConstant(1.0);
+        // Evaluate all 6 permutations × 8 sign flips = 48 candidates
+        for (const auto& p : permutations) {
+            for (int sign_bits = 0; sign_bits < 8; ++sign_bits) {
+                // Derive the sign of each axis from bits (0 => -1, 1 => +1)
+                // s0 is bit0, s1 is bit1, s2 is bit2 of sign_bits
+                const int s0 = (sign_bits & 1) ? 1 : -1;
+                const int s1 = (sign_bits & 2) ? 1 : -1;
+                const int s2 = (sign_bits & 4) ? 1 : -1;
 
-        double ceps = eps * 2;
-        size_t iter = 0;
+                // Construct candidate columns
+                Eigen::Vector3d c0 = s0 * col[p[0]];
+                Eigen::Vector3d c1 = s1 * col[p[1]];
+                Eigen::Vector3d c2 = s2 * col[p[2]];
 
-        // Main iterative loop
-        while (iter < maxiter && ceps > eps) {
-            // Construct diagonal matrix diag(p)
-            Eigen::MatrixXd dp = Eigen::MatrixXd::Zero(N, N);
-            for (size_t i = 0; i < N; ++i) {
-                dp(i, i) = p(i);
-            }
+                // Score: how close are we to the identity?
+                // Since e_x = (1,0,0), e_y = (0,1,0), e_z = (0,0,1),
+                // we can skip dot products & do c0(0)+c1(1)+c2(2).
+                double score = c0(0) + c1(1) + c2(2);
 
-            // Compute Lambda_p = Ap * diag(p) * Ap^T
-            Eigen::MatrixXd Lambdap = Ap * dp * Ap.transpose();
+                // If this orientation is better, update the best.
+                if (score > best_score) {
+                    best_score = score;
+                    best_R.col(0) = c0;
+                    best_R.col(1) = c1;
+                    best_R.col(2) = c2;
 
-            // Compute inverse of Lambda_p
-            Eigen::MatrixXd ILp = Lambdap.inverse();
-
-            // Compute M = A_p^T * Lambda_p^{-1} * A_p
-            Eigen::MatrixXd M = Ap.transpose() * (ILp * Ap);
-
-            // Identify maximum diagonal element of M and its index
-            double maxval = 0.0;
-            size_t maxi = 0;
-            for (auto i = 0; i < M.rows(); ++i) {
-                double val = M(i, i);
-                if (val > maxval) {
-                    maxval = val;
-                    maxi = i;
+                    // Re-permute extents: if the axis p[0] in old frame
+                    // now goes to new X, etc.
+                    best_radii(0) = radii(p[0]);
+                    best_radii(1) = radii(p[1]);
+                    best_radii(2) = radii(p[2]);
                 }
             }
+        }
 
-            // Compute the step size based on the maximum diagonal element
-            double step_size =
-                    (maxval - d - 1.0) / ((d + 1.0) * (maxval - 1.0));
+        // Update the OBB with the best orientation found
+        obel.R_ = best_R;
+        obel.radii_ = best_radii;
+    };
+
+    auto KhachiyanAlgo = [&](const Eigen::MatrixXd& A, double eps, int maxiter,
+                             Eigen::MatrixXd& Q, Eigen::VectorXd& c) -> double {
+        // Initialize uniform weights: p_i = 1/N for all i
+        Eigen::VectorXd p = Eigen::VectorXd::Constant(
+                numVertices, 1.0 / static_cast<double>(numVertices));
+
+        // Lift matrix A to Ap by adding a bottom row of ones
+        Eigen::MatrixXd Ap(4, numVertices);
+        Ap.topRows(3) = A;
+        Ap.row(3).setOnes();
+
+        double currentEps = 2.0 * eps;  // Start with a large difference
+        int iter = 0;
+
+        // Main iterative loop
+        while (iter < maxiter && currentEps > eps) {
+            // Compute Λ_p = Ap * diag(p) * Ap^T in a more efficient way
+            // ApP = Ap * diag(p)  => shape: (4) x N
+            // Then Lambda_p = ApP * Ap^T => shape: (4) x (4)
+            Eigen::MatrixXd ApP = Ap * p.asDiagonal();       // (4) x N
+            Eigen::Matrix4d LambdaP = ApP * Ap.transpose();  // (4) x (4)
+
+            // Compute inverse of Lambda_p via an LDLT factorization
+            // (faster and more numerically stable than .inverse())
+            Eigen::LDLT<Eigen::MatrixXd> ldltOfLambdaP(LambdaP);
+            if (ldltOfLambdaP.info() != Eigen::Success) {
+                throw std::runtime_error(
+                        "LDLT decomposition failed. Matrix may be singular.");
+            }
+
+            // M = Ap^T * (Lambda_p^{-1} * Ap)
+            // We'll do this in steps:
+            //    1) X = Lambda_p^{-1} * Ap
+            //    2) M = Ap^T * X
+            // Dimensions:
+            //    Lambda_p^{-1}: (4 x (4)
+            //    Ap: (4) x N
+            // => X: (4) x N
+            // => M: Nx(4) * (4)xN -> NxN
+            Eigen::MatrixXd X = ldltOfLambdaP.solve(Ap);  // (4) x N
+            Eigen::MatrixXd M = Ap.transpose() * X;       // NxN
+
+            // Find max diagonal element and index
+            Eigen::Index maxIndex;
+            double maxVal = M.diagonal().maxCoeff(&maxIndex);
+
+            // Compute step size alpha (called step_size here)
+            // Formula: alpha = (maxVal - 4) / ((4) * (maxVal - 1))
+            const double step_size = (maxVal - 4) / (4 * (maxVal - 1.0));
 
             // Update weights p
-            Eigen::VectorXd newp = (1.0 - step_size) * p;
-            newp(maxi) += step_size;
+            Eigen::VectorXd newP = (1.0 - step_size) * p;
+            newP(maxIndex) += step_size;
 
-            // Compute error as the norm of the change in p
-            ceps = (newp - p).norm();
-            p = newp;
+            // Compute the change for the stopping criterion
+            currentEps = (newP - p).norm();
+            p.swap(newP);  // Efficient swap instead of copy
+
             ++iter;
         }
 
-        // After convergence, compute dual parameters Q and c
-        // Recompute diagonal matrix diag(p) with final weights
-        Eigen::MatrixXd dp = Eigen::MatrixXd::Zero(N, N);
-        for (size_t i = 0; i < N; ++i) {
-            dp(i, i) = p(i);
+        // After convergence or reaching max iterations,
+        // compute Q and center c for the ellipsoid.
+
+        // 1) PN = A * diag(p) * A^T
+        Eigen::MatrixXd AP = A * p.asDiagonal();  // 3 x N
+        Eigen::Matrix3d PN = AP * A.transpose();  // 3 x 3
+
+        // 2) M2 = A * p => a 3-dimensional vector
+        Eigen::Vector3d M2 = A * p;  // 3 x 1
+
+        // 3) M3 = M2 * M2^T => 3 x 3 outer product
+        Eigen::Matrix3d M3 = M2 * M2.transpose();  // 3 x 3
+
+        // 4) Invert (PN - M3) via LDLT
+        Eigen::Matrix3d toInvert = PN - M3;  // 3 x 3
+        Eigen::LDLT<Eigen::Matrix3d> ldltOfToInvert(toInvert);
+        if (ldltOfToInvert.info() != Eigen::Success) {
+            throw std::runtime_error(
+                    "LDLT decomposition failed in final step.");
         }
 
-        // Compute PN = A * diag(p) * A^T
-        Eigen::MatrixXd PN = A * dp * A.transpose();
+        // Q = (toInvert)^{-1} / 3   => shape matrix of the ellipsoid
+        // c = A * p                 => center of the ellipsoid
+        Q = ldltOfToInvert.solve(Eigen::Matrix3d::Identity()) /
+            static_cast<double>(3);
+        c = M2;  // Already computed as A*p
 
-        // Compute M2 = A * p
-        Eigen::VectorXd M2 = A * p;
-
-        // Compute M3 = M2 * M2^T
-        Eigen::MatrixXd M3 = M2 * M2.transpose();
-
-        // Compute inverse of (PN - M3)
-        Eigen::MatrixXd invert = (PN - M3).inverse();
-
-        // Calculate Q and center c from the inverted matrix and weights
-        Q = invert / static_cast<double>(d);
-        c = A * p;
-
-        return ceps;
+        return currentEps;
     };
 
     // Assemble matrix A with dimensions d x n_points, where each column is a
     // point
-    Eigen::MatrixXd A(d, n_points);
-    for (int i = 0; i < n_points; ++i) {
-        A.col(i) = points[i];
+    Eigen::MatrixXd A(3, numVertices);
+    for (int i = 0; i < numVertices; ++i) {
+        A.col(i) = hullV[i];
     }
 
     // Set parameters for Khachiyan's algorithm
@@ -244,6 +319,9 @@ OrientedBoundingEllipsoid OrientedBoundingEllipsoid::CreateFromPoints(
     obel.center_ = c.head<3>();  // center vector of length 3
     obel.R_ = eigenvectors;      // orientation matrix
     obel.radii_ = radii;         // ellipsoid radii
+
+    // Check oritntation and permute axes to closest identity
+    mapToClosestIdentity(obel);
 
     return obel;
 }
