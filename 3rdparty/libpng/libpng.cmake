@@ -4,7 +4,6 @@ if(MSVC)
     set(LIBPNG_LIB_NAME libpng16_static)
 else()
     set(LIBPNG_LIB_NAME png16)
-    # Add the -fno-define-target-os-macros flag for non-MSVC compilers (for instance, Clang)
 endif()
 
 ExternalProject_Add(
@@ -16,7 +15,6 @@ ExternalProject_Add(
     UPDATE_COMMAND ""
     CMAKE_ARGS
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-        -DCMAKE_CXX_FLAGS=-fno-define-target-os-macros
         -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
         -DPNG_SHARED=OFF
         -DPNG_EXECUTABLES=OFF
